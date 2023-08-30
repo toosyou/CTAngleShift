@@ -16,6 +16,7 @@ tqdm = "*"
 scikit-image = "*"
 better-exceptions = "*"
 opencv-python = "*"
+jupyter-ai = "*"
 
 [requires]
 python_version = "*"
