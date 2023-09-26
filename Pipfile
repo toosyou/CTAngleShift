@@ -7,6 +7,7 @@ name = "pypi"
 numpy = "*"
 cupy-cuda11x = "*"
 bayesian-optimization = "*"
+loguru = "*"
 
 [dev-packages]
 jupyterlab = "*"

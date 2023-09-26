@@ -13,7 +13,7 @@ def theta_correction(sinogram, theta, n_keypoints, shift_range, init_points=50, 
     Correct theta shift in sinogram.
 
     args:
-        sinogram: (n_angles, N, M)
+        sinogram: (N, n_angles, M)
         theta: (n_angles,) array of the original theta in radians
         n_keypoints: number of keypoints
         shift_range: range of shift in radians
