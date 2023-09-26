@@ -8,13 +8,14 @@ from cupyx.scipy.signal import convolve2d
 
 from bayes_opt import BayesianOptimization
 
-def theta_correction(sinogram, theta, n_keypoints, shift_range, init_points=50, n_iter=300):
+def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_points=50, n_iter=300):
     '''
     Correct theta shift in sinogram.
 
     args:
         sinogram: (N, n_angles, M)
         theta: (n_angles,) array of the original theta in radians
+        center: (N, ) center of rotation
         n_keypoints: number of keypoints
         shift_range: range of shift in radians
         init_points: number of initial points in Bayesian Optimization
@@ -49,21 +50,22 @@ def theta_correction(sinogram, theta, n_keypoints, shift_range, init_points=50, 
     def loss(**args):
         theta = interp_theta(np.array(list(args.values())))
         
-        recon = tomopy.recon(sinogram,
+        recon = tomopy.recon(np.pad(sinogram, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
                          theta,
-                         center=None,
+                         center=center,
                          algorithm=tomopy.astra,
                          sinogram_order=True,
-                         options={'proj_type': 'cuda', 'method': 'FBP_CUDA'},
-                         ncore=1)
-        recon = tomopy.circ_mask(recon, axis=0, ratio=0.95, val=0) # (N, M, M)
+                         options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
+                         ncore=1)[:, pad_width:-pad_width, pad_width:-pad_width]
+        recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
         return -acutance(recon)
         
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
-    assumed_theta, n_angles = theta, len(theta)
+    assumed_theta, n_angles, width = theta, len(theta), sinogram.shape[2]
+    pad_width = width // 4 + 1
     
     # Bounded region of parameter space
     pbounds = {'input' + str(i): shift_range for i in range(n_keypoints)}
