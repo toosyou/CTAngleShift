@@ -69,7 +69,7 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
     
     # Bounded region of parameter space
     pbounds = {'input' + str(i): shift_range for i in range(n_keypoints)}
-    optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1)
+    optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1, allow_duplicate_points=True)
 
     # probe the assumed theta
     optimizer.probe(params={'input' + str(i): 0 for i in range(n_keypoints)})
