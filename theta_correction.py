@@ -24,6 +24,18 @@ def acutance(recon):
     # mean of the gradient magnitude
     return gradient_magnitude / len(recon)
 
+def padded_recon(sinogram, theta, center, pad_width):
+    if center is not None: center = center + pad_width
+    recon = tomopy.recon(np.pad(sinogram, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
+                         theta,
+                         center=center,
+                         algorithm=tomopy.astra,
+                         sinogram_order=True,
+                         options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
+                         ncore=1)[:, pad_width:-pad_width, pad_width:-pad_width]
+    recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
+    return recon
+
 def center_correction(sinogram, z_indices, total_z, theta, center_range, init_points=50, n_iter=300):
     '''
     Correct center shift in sinogram
@@ -43,16 +55,8 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
     def loss(start_center, end_center):
         X = [z_indices[0], z_indices[-1]]
         y = [start_center, end_center]
-        centers = interp1d(X, y, kind='linear')(z_indices)
-        recon = tomopy.recon(np.pad(sinogram, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
-                         theta,
-                         center = centers + width / 2 + pad_width,
-                         algorithm=tomopy.astra,
-                         sinogram_order=True,
-                         options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
-                         ncore=1)[:, pad_width:-pad_width, pad_width:-pad_width]
-        recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
-        return -acutance(recon)
+        center = interp1d(X, y, kind='linear')(z_indices) + width / 2
+        return -acutance(padded_recon(sinogram, theta, center, pad_width))
         
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
@@ -68,8 +72,8 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
     }
     optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1, allow_duplicate_points=True)
 
-    # probe the assumed theta
-    optimizer.probe(params={'start_center': 0, 'end_center': 0})
+    # probe the assumed center and theta
+    optimizer.probe({'start_center': 0, 'end_center': 0})
 
     optimizer.maximize(
         init_points = init_points,
@@ -106,17 +110,8 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
 
     def loss(**args):
         theta = interp_theta(np.array(list(args.values())))
-        
-        recon = tomopy.recon(np.pad(sinogram, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
-                         theta,
-                         center=center + pad_width if center is not None else None,
-                         algorithm=tomopy.astra,
-                         sinogram_order=True,
-                         options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
-                         ncore=1)[:, pad_width:-pad_width, pad_width:-pad_width]
-        recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
-        return -acutance(recon)
-        
+        return -acutance(padded_recon(sinogram, theta, center, pad_width))
+    
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
