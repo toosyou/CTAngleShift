@@ -20,7 +20,7 @@ from multiprocessing import Pool
 
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from theta_correction import theta_correction
+from theta_correction import theta_correction, center_correction
 
 def align(im1, im2, motion_model=cv2.MOTION_EUCLIDEAN):
     im1, im2 = im1.astype('float32'), im2.astype('float32')
@@ -211,17 +211,27 @@ def negative_log(projections):
     projections = np.where(projections > 0, projections, ma.array(projections, mask=projections <= 0).min(keepdims=True))
     return -np.log(projections)
 
-def find_correct_angles(projections, angles, n_angle_sample=5, n_keypoints=8, shift_range=(-0.015, 0.015), init_points=50, n_iter=400):
+def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-10, 10), init_points=50, n_iter=150):
+    sample_indices = np.linspace(0, projections.shape[1], n_center_sample+2)[1:-1].astype(int)
+    sample_sinogram = projections[:, sample_indices, :]
+
+    return center_correction(sample_sinogram.transpose(1, 0, 2), sample_indices, projections.shape[1], angles, shift_range, init_points, n_iter)
+
+def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_keypoints=8, shift_range=(-0.015, 0.015), init_points=50, n_iter=400):
     sample_indices = np.linspace(0, projections.shape[1], n_angle_sample+2)[1:-1].astype(int)
     sample_sinogram = projections[:, sample_indices, :]
 
-    return theta_correction(sample_sinogram.transpose(1, 0, 2), angles, None, n_keypoints, shift_range, init_points, n_iter)
+    if center is not None:
+        center = center[sample_indices]
 
-def reconstruct(projections, angles, value_range=None):
+    return theta_correction(sample_sinogram.transpose(1, 0, 2), angles, center, n_keypoints, shift_range, init_points, n_iter)
+
+def reconstruct(projections, angles, center=None, value_range=None):
     pad_width = projections.shape[-1] // 4 + 1
+    if center is not None: center = center + pad_width
     recon = tomopy.recon(np.pad(projections, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
                             angles,
-                            center=None,
+                            center=center,
                             algorithm=tomopy.astra,
                             sinogram_order=False,
                             options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
@@ -236,11 +246,14 @@ def reconstruct(projections, angles, value_range=None):
 
     return recon
 
-def find_value_range(projections, angles, n_range_sample=10):
+def find_value_range(projections, angles, center=None, n_range_sample=10):
     sample_indices = np.linspace(0, projections.shape[1], n_range_sample+2)[1:-1].astype(int)
     sample_sinogram = projections[:, sample_indices, :]
 
-    recon = reconstruct(sample_sinogram, angles)
+    if center is not None:
+        center = center[sample_indices]
+
+    recon = reconstruct(sample_sinogram, angles, center)
 
     valid = recon[recon != 0]
     vmin = np.percentile(valid[valid <= np.percentile(valid, 1)], 1)
@@ -256,6 +269,7 @@ def main():
     parser.add_argument('-r', dest='ring_removal', type=int, choices=[0, 1, 2], default=1, 
                         help='ring removal option: 0(no ring removal), 1(fast ring removal, default) or 2(Fourier-Wavelet based ring removal)')
     parser.add_argument('-a', dest='angle_shift', action='store_true', help='do angle shift correction')
+    parser.add_argument('-c', dest='center_shift', action='store_true', help='do center shift correction')
     parser.add_argument('-b', dest='batch_size', type=int, help='batch size for reconstruction (default = 100)', default=100)
     parser.add_argument('-o', dest='output_dir', type=str, help='directory of output', default='./recons')
 
@@ -283,18 +297,27 @@ def main():
         logger.info("Performing ring removal")
         projections = ring_removal(projections, args.ring_removal == 2)
 
-    if args.angle_shift:
+    center = None
+    if args.angle_shift and args.center_shift:
+        for i in range(3):
+            logger.info("Angle and center shift correction iteration {}/3".format(i))
+            angles = find_correct_angles(projections, angles, center, init_points=30, n_iter=150)
+            center = find_correct_centers(projections, angles, init_points=30, n_iter=100)
+    elif args.center_shift:
+        logger.info("Finding correct center")
+        center = find_correct_centers(projections, angles)
+    elif args.angle_shift:
         logger.info("Finding correct angles")
         angles = find_correct_angles(projections, angles)
 
     projections = negative_log(projections)
-    vmin, vmax = find_value_range(projections, angles)
+    vmin, vmax = find_value_range(projections, angles, center)
 
     # batch reconstruction
     logger.info("Starting batch reconstruction")
     for i in tqdm(range(0, projections.shape[1], args.batch_size), desc='Reconstructing'):
         end = min(i + args.batch_size, projections.shape[1])
-        recon = reconstruct(projections[:, i: end, :], angles, (vmin, vmax))
+        recon = reconstruct(projections[:, i: end, :], angles, center[i: end] if center is not None else None, (vmin, vmax))
         recon = (recon * 65535).astype('uint16')
 
         # save to files
