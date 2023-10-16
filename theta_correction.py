@@ -1,12 +1,209 @@
+import torch
 import tomopy
 import numpy as np
 
-from scipy.interpolate import interp1d
+from tqdm import tqdm
+from scipy.interpolate import interp1d, interp2d
 
 import cupy as cp
 from cupyx.scipy.signal import convolve2d
 
 from bayes_opt import BayesianOptimization
+
+from torch import nn
+from torch.nn import functional as F
+from xitorch.interpolate import Interp1D
+
+class EarlyStopping():
+    def __init__(self, model=None, patient=5, epsilon=1e-7):
+        self.model = model
+        self.patient = patient
+        self.min_loss = np.inf
+        self.counter = 0
+        self.early_stop = False
+        self.best_model = None
+        self.epsilon = epsilon
+
+    def __call__(self, loss):
+        if loss > self.min_loss - self.epsilon:
+            self.counter += 1
+            if self.counter > self.patient:
+                self.early_stop = True
+                return True
+        else:
+            self.counter = 0
+            self.min_loss = loss
+            if self.model is not None:
+                self.best_model = self.model.state_dict()
+            return False
+        
+class SampledFBP(nn.Module):
+    ''' 
+    Sampled Filtered Backprojection
+
+    Args:
+        sinogram: (N, 1, n_angles, M) sinogram
+        n_patch: number of patches
+        patch_size: size of the patch
+        circle: whether to use a circle mask
+        filtered: whether to apply ramp filter
+    '''
+    def __init__(self, sinogram, n_patches, patch_size, circle=True, filtered=True):
+        super().__init__()
+        
+        self.n_patches = n_patches
+        self.patch_size = patch_size
+        self.circle = circle
+
+        self.N, _, self.n_angles, self.M = sinogram.shape
+
+        # generate a patch grid
+        X = torch.arange(self.patch_size) - self.patch_size / 2
+        patch_basegrid_X, patch_basegrid_y = torch.meshgrid(X, X)
+
+        self.register_buffer('sinogram', torch.Tensor(sinogram).double())
+        self.register_buffer('patch_basegrid_X', patch_basegrid_X)
+        self.register_buffer('patch_basegrid_y', patch_basegrid_y)
+
+        if filtered: self.apply_filter()
+
+    @staticmethod
+    def rampfilter(size):
+        n = np.concatenate((np.arange(1, size / 2 + 1, 2, dtype=int),
+                            np.arange(size / 2 - 1, 0, -2, dtype=int)))
+        f = np.zeros(size)
+        f[0] = 0.25
+        f[1::2] = -1 / (np.pi * n) ** 2
+        return torch.tensor(2 * np.real(np.fft.fft(f)))
+    
+    def apply_filter(self):
+        # padding values
+        final_width = max(64, int(2 ** (2 * torch.tensor(self.M)).float().log2().ceil()))
+        pad_width = (final_width - self.M)
+
+        filter = self.rampfilter(final_width)
+
+        # pad sinogram
+        self.sinogram = F.pad(self.sinogram, [0, pad_width], mode='constant', value=0) # (N, 1, n_angles, M + pad_width)
+
+        # apply filter
+        self.sinogram = torch.fft.fft(self.sinogram, dim=-1) * filter.double()
+        self.sinogram = torch.real(torch.fft.ifft(self.sinogram, dim=-1))[..., :self.M] # (N, 1, n_angles, M)
+
+    def generate_patches(self):
+        # duplicate patch grid for each sample
+        patch_grid_X = self.patch_basegrid_X[None].repeat(self.n_patches, 1, 1)
+        patch_grid_y = self.patch_basegrid_y[None].repeat(self.n_patches, 1, 1)
+
+        # sample center points inside central circle
+        r = torch.rand(self.n_patches, device=patch_grid_X.device) * self.M / 2
+        theta = torch.rand(self.n_patches, device=patch_grid_X.device) * 2 * np.pi
+
+        # convert to cartesian coordinates
+        x = r * torch.cos(theta) + self.M / 2
+        y = r * torch.sin(theta) + self.M / 2
+
+        # shift patch grid to the center points
+        patch_grid_X = patch_grid_X + x[:, None, None]
+        patch_grid_y = patch_grid_y + y[:, None, None]
+
+        # convert the value range to (-1, 1)
+        patch_grid_X = patch_grid_X / ((self.M-1) / 2) - 1
+        patch_grid_y = patch_grid_y / ((self.M-1) / 2) - 1
+
+        return patch_grid_X, patch_grid_y
+    
+    def generate_circle_mask(self, patch_grid_X, patch_grid_y):
+        return (patch_grid_X ** 2 + patch_grid_y ** 2) <= 1
+
+    def forward(self, theta):
+        theta = torch.Tensor(theta).double().to(self.sinogram.device)
+
+        patch_grid_X, patch_grid_y = self.generate_patches() # (n_patch, patch_size, patch_size)
+
+        theta = theta[:, None, None]
+        recon_grid_X = patch_grid_X.unsqueeze(1) * theta.cos() - patch_grid_y.unsqueeze(1) * theta.sin() 
+        recon_grid_X = recon_grid_X.unsqueeze(-1) # (n_patch, n_angles, patch_size, patch_size, 1)
+        recon_grid_y = torch.ones_like(recon_grid_X) * torch.linspace(-1, 1, self.n_angles, device=theta.device)[:, None, None, None]
+
+        recon_grid = torch.cat((recon_grid_X, recon_grid_y), dim=-1)
+        recon_grid = recon_grid.view(1, self.n_patches * self.n_angles * self.patch_size, self.patch_size, 2)
+        recon_grid = recon_grid.repeat(self.N, 1, 1, 1)
+
+        recon = F.grid_sample(self.sinogram, recon_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+        recon = recon.view(self.N, self.n_patches, self.n_angles, self.patch_size, self.patch_size).sum(2)
+
+        if self.circle:
+            recon = recon * self.generate_circle_mask(patch_grid_X, patch_grid_y)
+        return recon * np.pi / (2 * self.n_angles) # (N, n_patch, patch_size, patch_size)
+
+class ThetaEstimator(nn.Module):
+    def __init__(self, sinogram, assumed_angles, n_keypoints, n_patches=16, patch_size=64):
+        '''
+        Args:
+            sinogram: (N, 1, n_angles, M) sinogram
+            assumed_angles: (n_angles, ) array of assumed theta in radians
+            n_keypoints: number of keypoints
+            n_patches: number of patches
+            patch_size: size of the patch, if smaller than 1 the patch_size will be M * patch_size
+        '''
+
+        super().__init__()
+
+        self.n_sinograms, _, self.n_angles, self.size = sinogram.shape
+
+        self.n_patches = n_patches
+        self.patch_size = patch_size if patch_size > 1 else int(self.size * patch_size)
+
+        self.n_keypoints = n_keypoints
+        self.shift = nn.Parameter(torch.zeros(n_keypoints, ))
+
+        self.interp_f = Interp1D(torch.linspace(0, self.n_angles, self.n_keypoints).cuda(), assume_sorted=True)
+
+        loss_kernel = torch.tensor([[1, 0, -1],
+                                    [2, 0, -2],
+                                    [1, 0, -1],])
+        # to (n_patches, n_patches, 3, 3)
+        loss_kernel = loss_kernel.unsqueeze(0).unsqueeze(0).double()
+        loss_kernel = loss_kernel.repeat(n_patches, 1, 1, 1)
+
+        self.fbp = SampledFBP(sinogram, n_patches, patch_size, True, True)
+
+        self.register_buffer('interp_range', torch.arange(self.n_angles))
+        self.register_buffer('loss_kernel', loss_kernel)
+        self.register_buffer('sinogram', torch.Tensor(sinogram).double())
+        self.register_buffer('assumed_angles', torch.Tensor(assumed_angles).double())
+
+    def cuda(self):
+        super().cuda()
+        self.fbp = self.fbp.cuda()
+        return self
+
+    def interp_shift(self):
+        '''
+        Interpolate keypoints to get angle shift.
+
+        return:
+            shift: (n_angles, ) array of shift in radians
+        '''
+        return self.interp_f(self.interp_range, self.shift)
+
+    def forward(self):
+        '''
+        return:
+            estimated_theta: (n_angles, ) array of theta in radians
+        '''
+        return self.assumed_angles + self.interp_shift()
+
+    def loss(self):
+        theta = self.forward()
+
+        # fbp_op = fbp(angles=theta, image_size=self.size, circle=True, device=theta.device)
+        # recon = fbp_op(self.sinogram).cuda()
+        recon = self.fbp(theta) # (N, n_patches, patch_size, patch_size)
+
+        gm = ((F.conv2d(recon, self.loss_kernel, padding='valid', groups=self.n_patches) ** 2 + F.conv2d(recon, self.loss_kernel.transpose(2, 3), padding='valid', groups=self.n_patches) ** 2 + 1e-7) ** 0.5).mean()
+        return gm # smaller is better
 
 def acutance(recon):
     # sobal kernel
@@ -132,3 +329,64 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
     )
 
     return interp_theta(np.array(list(optimizer.max['params'].values())))
+
+def theta_correction_gd(sinogram, theta, center=None, n_keypoints=None, steps=10, patient=3):
+    '''
+    Correct theta shift in sinogram using gradient descent.
+
+    args:
+        sinogram: (N, n_angles, M)
+        theta: (n_angles,) array of the original theta in radians
+        center: (N, ) center of rotation (default: M / 2)
+        n_keypoints: number of keypoints (default: n_angles // 30)
+        patient: number of epochs to wait before early stopping
+
+    return:
+        corrected_theta: (n_angles,) array of corrected theta
+    '''
+
+    # make sure sinogram is 3D
+    if len(sinogram.shape) == 2:
+        sinogram = np.array(sinogram)[np.newaxis, ...]
+
+    N, n_angles, M = sinogram.shape
+
+    if center is not None:
+        if np.isscalar(center):
+            center = np.array([center] * N)
+
+        # shift sinogram to the center using interp2d
+        X, y = np.arange(M), np.arange(n_angles)
+        sinogram = np.array([interp2d(X, y, sino, kind='linear')(X + c - M / 2, y) for sino, c in zip(sinogram, center)])
+
+    if n_keypoints is None:
+        n_keypoints = n_angles // 30
+    
+    sinogram = sinogram[:, np.newaxis, ...] # (N, 1, n_angles, M)
+    estimator = ThetaEstimator(sinogram, theta, n_keypoints).cuda()
+    
+    optimizer = torch.optim.Adam(estimator.parameters(), lr=1e-3)
+    early_stopping = EarlyStopping(estimator, patient=patient)
+
+    pbar = tqdm()
+    while not early_stopping.early_stop:
+        epoch_loss = 0
+        for _ in range(steps):
+            optimizer.zero_grad()
+            loss = estimator.loss()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+        epoch_loss /= steps
+        early_stopping(epoch_loss)
+
+        # update progress bar
+        pbar.set_description('loss: {:.8f}'.format(epoch_loss))
+        pbar.update(1)
+
+    pbar.close()
+
+    # restore the best model
+    estimator.load_state_dict(early_stopping.best_model)
+    return estimator.forward().cpu().detach().numpy()

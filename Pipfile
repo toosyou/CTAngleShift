@@ -8,6 +8,11 @@ numpy = "*"
 cupy-cuda11x = "*"
 bayesian-optimization = "*"
 loguru = "*"
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
+radon-transformation = {editable = true, path = "./Radon-Transformation"}
+xitorch = "*"
 
 [dev-packages]
 jupyterlab = "*"
@@ -17,7 +22,6 @@ tqdm = "*"
 scikit-image = "*"
 better-exceptions = "*"
 opencv-python = "*"
-jupyter-ai = "*"
 
 [requires]
 python_version = "*"
