@@ -116,19 +116,25 @@ class SampledFBP(nn.Module):
     def generate_circle_mask(self, patch_grid_X, patch_grid_y):
         return (patch_grid_X ** 2 + patch_grid_y ** 2) <= 1
 
-    def forward(self, theta):
+    def forward(self, theta, center=None):
+        if center is None:
+            center = torch.Tensor([self.M / 2] * self.N).double().to(self.sinogram.device)
+        elif np.isscalar(center):
+            center = torch.Tensor([center] * self.N).double().to(self.sinogram.device)
+
         theta = torch.Tensor(theta).double().to(self.sinogram.device)
 
         patch_grid_X, patch_grid_y = self.generate_patches() # (n_patch, patch_size, patch_size)
 
         theta = theta[:, None, None]
-        recon_grid_X = patch_grid_X.unsqueeze(1) * theta.cos() - patch_grid_y.unsqueeze(1) * theta.sin() 
+        recon_grid_X = patch_grid_X.unsqueeze(1) * theta.cos() - patch_grid_y.unsqueeze(1) * theta.sin()
         recon_grid_X = recon_grid_X.unsqueeze(-1) # (n_patch, n_angles, patch_size, patch_size, 1)
         recon_grid_y = torch.ones_like(recon_grid_X) * torch.linspace(-1, 1, self.n_angles, device=theta.device)[:, None, None, None]
 
         recon_grid = torch.cat((recon_grid_X, recon_grid_y), dim=-1)
         recon_grid = recon_grid.view(1, self.n_patches * self.n_angles * self.patch_size, self.patch_size, 2)
         recon_grid = recon_grid.repeat(self.N, 1, 1, 1)
+        recon_grid[..., 0] += (center / self.M * 2 - 1).view(-1, 1, 1)
 
         recon = F.grid_sample(self.sinogram, recon_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
         recon = recon.view(self.N, self.n_patches, self.n_angles, self.patch_size, self.patch_size).sum(2)
@@ -138,37 +144,42 @@ class SampledFBP(nn.Module):
         return recon * np.pi / (2 * self.n_angles) # (N, n_patch, patch_size, patch_size)
 
 class ThetaEstimator(nn.Module):
-    def __init__(self, sinogram, assumed_angles, n_keypoints, n_patches=16, patch_size=64):
+    def __init__(self, sinogram, assumed_angles, n_keypoints, z_indices=None, n_patches=16, patch_size=64):
         '''
         Args:
             sinogram: (N, 1, n_angles, M) sinogram
             assumed_angles: (n_angles, ) array of assumed theta in radians
             n_keypoints: number of keypoints
+            z_indices: (N, ) z indices of the sinogram starting from 0, if given, center correction will be applied
             n_patches: number of patches
             patch_size: size of the patch, if smaller than 1 the patch_size will be M * patch_size
         '''
 
         super().__init__()
 
-        self.n_sinograms, _, self.n_angles, self.size = sinogram.shape
+        self.n_sinograms, _, self.n_angles, self.M = sinogram.shape
 
         self.n_patches = n_patches
-        self.patch_size = patch_size if patch_size > 1 else int(self.size * patch_size)
+        self.patch_size = patch_size if patch_size > 1 else int(self.M * patch_size)
 
         self.n_keypoints = n_keypoints
-        self.shift = nn.Parameter(torch.zeros(n_keypoints, ))
+        self.angle_shift = nn.Parameter(torch.zeros(n_keypoints, ))
 
-        self.interp_f = Interp1D(torch.linspace(0, self.n_angles, self.n_keypoints).cuda(), assume_sorted=True)
+        self.do_center_correction = z_indices is not None
+        self.center_shift = nn.Parameter(torch.zeros(2, )) if self.do_center_correction else None
+
+        self.interp_angle_f = Interp1D(torch.linspace(0, self.n_angles, self.n_keypoints).cuda(), assume_sorted=True)
 
         loss_kernel = torch.tensor([[1, 0, -1],
                                     [2, 0, -2],
                                     [1, 0, -1],])
-        # to (n_patches, n_patches, 3, 3)
+        # to (n_patches, 1, 3, 3)
         loss_kernel = loss_kernel.unsqueeze(0).unsqueeze(0).double()
         loss_kernel = loss_kernel.repeat(n_patches, 1, 1, 1)
 
         self.fbp = SampledFBP(sinogram, n_patches, patch_size, True, True)
 
+        self.register_buffer('z_indices', torch.Tensor(z_indices).double() if z_indices is not None else None)
         self.register_buffer('interp_range', torch.arange(self.n_angles))
         self.register_buffer('loss_kernel', loss_kernel)
         self.register_buffer('sinogram', torch.Tensor(sinogram).double())
@@ -179,28 +190,51 @@ class ThetaEstimator(nn.Module):
         self.fbp = self.fbp.cuda()
         return self
 
-    def interp_shift(self):
+    def interp_angle_shift(self):
         '''
         Interpolate keypoints to get angle shift.
 
         return:
-            shift: (n_angles, ) array of shift in radians
+            angle_shift: (n_angles, ) array of angle shift in radians
         '''
-        return self.interp_f(self.interp_range, self.shift)
+        return self.interp_angle_f(self.interp_range, self.angle_shift)
 
-    def forward(self):
+    def interp_center_shift(self, z_indices):
+        '''
+        Interpolate the start and the end to get center shift.
+
+        return:
+            center_shift: (n, ) array of center shift
+        '''
+        z_range = self.z_indices[-1] - self.z_indices[0]
+        shift_range = self.center_shift[1] - self.center_shift[0]
+
+        return (z_indices - self.z_indices[0]) / (z_range + 1e-7) * (shift_range) + self.center_shift[0]
+
+    def forward(self, z_indices=None):
         '''
         return:
-            estimated_theta: (n_angles, ) array of theta in radians
+            estimated_theta, [estimated_center]: (n_angles, ) array of theta in radians, [(n, ) array of center if center correction is applied]
         '''
-        return self.assumed_angles + self.interp_shift()
+        angles = self.assumed_angles # + self.interp_angle_shift()
+
+        if self.do_center_correction:
+            if z_indices is None:
+                z_indices = self.z_indices
+            else:
+                z_indices = torch.Tensor(z_indices).double().to(self.sinogram.device)
+            return angles, self.interp_center_shift(z_indices)
+
+        return angles
 
     def loss(self):
-        theta = self.forward()
+        if self.do_center_correction:
+            angles, center = self.forward()
+        else:
+            angles = self.forward()
+            center = 0
 
-        # fbp_op = fbp(angles=theta, image_size=self.size, circle=True, device=theta.device)
-        # recon = fbp_op(self.sinogram).cuda()
-        recon = self.fbp(theta) # (N, n_patches, patch_size, patch_size)
+        recon = self.fbp(angles, center + self.M / 2) # (N, n_patches, patch_size, patch_size)
 
         gm = ((F.conv2d(recon, self.loss_kernel, padding='valid', groups=self.n_patches) ** 2 + F.conv2d(recon, self.loss_kernel.transpose(2, 3), padding='valid', groups=self.n_patches) ** 2 + 1e-7) ** 0.5).mean()
         return gm # smaller is better
@@ -330,7 +364,7 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
 
     return interp_theta(np.array(list(optimizer.max['params'].values())))
 
-def theta_correction_gd(sinogram, theta, center=None, n_keypoints=None, steps=10, patient=3):
+def theta_correction_gd(sinogram, theta, z_indices=None, total_z=None, n_keypoints=None, steps=10, patient=3):
     '''
     Correct theta shift in sinogram using gradient descent.
 
@@ -349,21 +383,15 @@ def theta_correction_gd(sinogram, theta, center=None, n_keypoints=None, steps=10
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
+    assert z_indices is None or total_z is not None, 'total_z must be given if z_indices is given'
+
     N, n_angles, M = sinogram.shape
-
-    if center is not None:
-        if np.isscalar(center):
-            center = np.array([center] * N)
-
-        # shift sinogram to the center using interp2d
-        X, y = np.arange(M), np.arange(n_angles)
-        sinogram = np.array([interp2d(X, y, sino, kind='linear')(X + c - M / 2, y) for sino, c in zip(sinogram, center)])
 
     if n_keypoints is None:
         n_keypoints = n_angles // 30
     
     sinogram = sinogram[:, np.newaxis, ...] # (N, 1, n_angles, M)
-    estimator = ThetaEstimator(sinogram, theta, n_keypoints).cuda()
+    estimator = ThetaEstimator(sinogram, theta, n_keypoints, z_indices).cuda()
     
     optimizer = torch.optim.Adam(estimator.parameters(), lr=1e-3)
     early_stopping = EarlyStopping(estimator, patient=patient)
@@ -389,4 +417,8 @@ def theta_correction_gd(sinogram, theta, center=None, n_keypoints=None, steps=10
 
     # restore the best model
     estimator.load_state_dict(early_stopping.best_model)
-    return estimator.forward().cpu().detach().numpy()
+    with torch.no_grad():
+        if z_indices is not None:
+            angles, center = estimator.forward(np.arange(total_z))
+            return angles.cpu().detach().numpy(), center.cpu().detach().numpy()
+        return estimator.forward().cpu().detach().numpy()
