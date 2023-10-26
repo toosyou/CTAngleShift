@@ -253,7 +253,7 @@ def find_value_range(projections, angles, center=None, n_range_sample=10):
     if center is not None:
         center = center[sample_indices]
 
-    recon = reconstruct(sample_sinogram, angles, center)
+    recon = reconstruct(negative_log(sample_sinogram), angles, center)
 
     valid = recon[recon != 0]
     vmin = np.percentile(valid[valid <= np.percentile(valid, 1)], 1)
@@ -299,6 +299,7 @@ def main():
 
     center = None
     if args.angle_shift and args.center_shift:
+        original_angles = angles.copy()
         for i in range(3):
             logger.info("Angle and center shift correction iteration {}/3".format(i))
             angles = find_correct_angles(projections, angles, center, init_points=30, n_iter=150)
@@ -310,14 +311,17 @@ def main():
         logger.info("Finding correct angles")
         angles = find_correct_angles(projections, angles)
 
-    projections = negative_log(projections)
+    logger.info("Finding value range")
     vmin, vmax = find_value_range(projections, angles, center)
 
     # batch reconstruction
     logger.info("Starting batch reconstruction")
     for i in tqdm(range(0, projections.shape[1], args.batch_size), desc='Reconstructing'):
         end = min(i + args.batch_size, projections.shape[1])
-        recon = reconstruct(projections[:, i: end, :], angles, center[i: end] if center is not None else None, (vmin, vmax))
+        recon = reconstruct(negative_log(projections[:, i: end, :]), 
+                            angles, 
+                            center[i: end] if center is not None else None, 
+                            (vmin, vmax))
         recon = (recon * 65535).astype('uint16')
 
         # save to files
