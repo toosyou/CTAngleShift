@@ -278,17 +278,11 @@ def main():
     # create output dir
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # get projection filenames
     logger.info("Finding projection filenames")
     proj_files = sorted(glob(args.proj_dir + '/tomo*.tif'))
 
-    # read background
     logger.info("Reading background")
     df_projection, ff_projection = read_background(args.proj_dir)
-
-    # read and align projections
-    logger.info("Finding alignment matrix and angles")
-    align_matrix, angles = find_align_matrix(proj_files, df_projection, ff_projection)
 
     logger.info("Reading and aligning projections")
     projections, angles = read_aligned(proj_files, df_projection, ff_projection)
@@ -299,7 +293,6 @@ def main():
 
     center = None
     if args.angle_shift and args.center_shift:
-        original_angles = angles.copy()
         for i in range(3):
             logger.info("Angle and center shift correction iteration {}/3".format(i))
             angles = find_correct_angles(projections, angles, center, init_points=30, n_iter=150)

@@ -111,11 +111,11 @@ class SampledFBP(nn.Module):
         patch_grid_y = self.patch_basegrid_y[None].repeat(self.n_patches, 1, 1)
 
         # sample center points inside central circle
-        x, y = self.sample_inside_circle(self.n_patches)
+        X, y = self.sample_inside_circle(self.n_patches)
 
         # shift patch grid to the center points
-        patch_grid_X = patch_grid_X + x[:, None, None]
-        patch_grid_y = patch_grid_y + y[:, None, None]
+        patch_grid_X = patch_grid_X + X.view(-1, 1, 1)
+        patch_grid_y = patch_grid_y + y.view(-1, 1, 1)
 
         # convert the value range to (-1, 1)
         patch_grid_X = patch_grid_X / ((self.M-1) / 2) - 1
@@ -148,7 +148,7 @@ class SampledFBP(nn.Module):
         return recon * np.pi / (2 * self.n_angles) # (N, n_patch, patch_size, patch_size)
 
 class ThetaEstimator(nn.Module):
-    def __init__(self, sinogram, assumed_angles, n_keypoints, n_patches=4, patch_size=128):
+    def __init__(self, sinogram, assumed_angles, n_keypoints, n_patches=2, patch_size=128):
         '''
         Args:
             sinogram: (N, 1, n_angles, M) sinogram
@@ -160,10 +160,10 @@ class ThetaEstimator(nn.Module):
 
         super().__init__()
 
-        self.n_sinograms, _, self.n_angles, self.size = sinogram.shape
+        self.n_sinograms, _, self.n_angles, self.M = sinogram.shape
 
         self.n_patches = n_patches
-        self.patch_size = patch_size if patch_size > 1 else int(self.size * patch_size)
+        self.patch_size = patch_size if patch_size > 1 else int(self.M * patch_size)
 
         self.n_keypoints = n_keypoints
         self.shift = nn.Parameter(torch.zeros(n_keypoints - 1, ))
@@ -172,17 +172,16 @@ class ThetaEstimator(nn.Module):
 
         loss_kernel = torch.tensor([[1, 0, -1],
                                     [2, 0, -2],
-                                    [1, 0, -1],])
-        # to (n_patches, 1, 3, 3)
-        loss_kernel = loss_kernel.unsqueeze(0).unsqueeze(0).double()
-        loss_kernel = loss_kernel.repeat(n_patches, 1, 1, 1)
+                                    [1, 0, -1],]) # (3, 3)
+        loss_kernel = loss_kernel.view(1, 1, 3, 3).double()
+        loss_kernel = loss_kernel.repeat(self.n_patches, 1, 1, 1)
 
         self.fbp = SampledFBP(sinogram, n_patches, patch_size, True, True)
 
         self.register_buffer('interp_range', torch.arange(self.n_angles))
         self.register_buffer('loss_kernel', loss_kernel)
         self.register_buffer('assumed_angles', torch.Tensor(assumed_angles).double())
-
+        
     def cuda(self):
         super().cuda()
         self.fbp = self.fbp.cuda()
@@ -204,15 +203,15 @@ class ThetaEstimator(nn.Module):
         '''
         return self.assumed_angles + self.interp_shift()
 
+    def gradient_magnitude(self, recon):
+        v_gradient = F.conv2d(recon, self.loss_kernel, padding='same', groups=self.n_patches) ** 2
+        h_gradient = F.conv2d(recon, self.loss_kernel.transpose(2, 3), padding='same', groups=self.n_patches) ** 2
+        gm = ((v_gradient + h_gradient + 1e-9) ** 0.5)
+
+        return gm
+
     def loss(self):
-        theta = self.forward()
-        recon = self.fbp(theta) # (N, n_patches, patch_size, patch_size)
-
-        v_gradient = F.conv2d(recon, self.loss_kernel, padding='valid', groups=self.n_patches) ** 2
-        h_gradient = F.conv2d(recon, self.loss_kernel.transpose(2, 3), padding='valid', groups=self.n_patches) ** 2
-        gm = ((v_gradient + h_gradient + 1e-9) ** 0.5).mean()
-
-        return gm # smaller is better
+        return self.gradient_magnitude(self.fbp(self.forward())).mean() # smaller is better
 
 def acutance(recon):
     # sobal kernel
@@ -339,7 +338,7 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
 
     return interp_theta(np.array(list(optimizer.max['params'].values())))
 
-def theta_correction_gd(sinogram, theta, center=None, n_keypoints=10, steps=30, patient=5):
+def theta_correction_gd(sinogram, theta, center=None, n_keypoints=10, steps=10, patient=2):
     '''
     Correct theta shift in sinogram using gradient descent.
 
@@ -354,11 +353,18 @@ def theta_correction_gd(sinogram, theta, center=None, n_keypoints=10, steps=30, 
         corrected_theta: (n_angles,) array of corrected theta
     '''
 
+    @torch.compile
+    def train_step(estimator, optimizer):
+        optimizer.zero_grad()
+        estimator.loss().backward()
+        optimizer.step()
+
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
     N, n_angles, M = sinogram.shape
+    pad_width = M // 4 + 1
 
     if center is not None:
         if np.isscalar(center):
@@ -375,25 +381,18 @@ def theta_correction_gd(sinogram, theta, center=None, n_keypoints=10, steps=30, 
     early_stopping = EarlyStopping(estimator, patient=patient)
 
     # register the initial loss to the early stopping
-    with torch.no_grad():
-        epoch_loss = 0
-        for _ in range(steps * 3):
-            epoch_loss += estimator.loss()
-        epoch_loss /= steps * 3
-        early_stopping(epoch_loss)
-    print('Initial loss: {:.8f}'.format(epoch_loss))
+    initial_loss = acutance(padded_recon(sinogram[:,0], theta, None, pad_width))
+    early_stopping(initial_loss)
+    print('Initial loss: {:.8f}'.format(initial_loss))
 
     pbar = tqdm()
     while not early_stopping.early_stop:
+        # estimator.update_sample_map()
         epoch_loss = 0
         for _ in range(steps):
-            optimizer.zero_grad()
-            loss = estimator.loss()
-            loss.backward()
-            optimizer.step()
+            train_step(estimator, optimizer)
 
-            epoch_loss += loss.item()
-        epoch_loss /= steps
+        epoch_loss = acutance(padded_recon(sinogram[:,0], estimator.forward().cpu().detach().numpy(), None, pad_width))
         early_stopping(epoch_loss)
 
         # update progress bar
