@@ -8,8 +8,7 @@ import tomopy
 import numpy as np
 import numpy.ma as ma
 
-from numpy.fft import fftshift, ifftshift
-from numpy.fft import fft, ifft
+from numpy.fft import fft, ifft, fftshift, ifftshift
 from PIL import Image
 from glob import glob
 from tqdm import tqdm
@@ -23,6 +22,19 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from theta_correction import theta_correction, center_correction
 
 def align(im1, im2, motion_model=cv2.MOTION_EUCLIDEAN):
+    '''
+    Aligns two images using ECC algorithm.
+
+    args:
+        im1: (H, W) First input image.
+        im2: (H, W) Second input image.
+        motion_model: Motion model type. Default is cv2.MOTION_EUCLIDEAN.
+
+    returns:
+        warp_matrix: Transformation matrix.
+        im2_aligned: Aligned second image.
+    '''
+
     im1, im2 = im1.astype('float32'), im2.astype('float32')
     
     # Find size of image1
@@ -60,6 +72,16 @@ def align(im1, im2, motion_model=cv2.MOTION_EUCLIDEAN):
     return warp_matrix, im2_aligned
 
 def read_background(proj_dir):
+    '''
+    Reads background images from a directory.
+
+    args:
+        proj_dir: Directory path containing background images. The background images should be named as DF*.tif and FF*.tif.
+
+    returns:
+        df: Median image of DF*.tif files.
+        ff: Median image of FF*.tif files.
+    '''
     df_filenames = glob(proj_dir + '/DF*.tif')
     ff_filenames = glob(proj_dir + '/FF*.tif')
 
@@ -69,6 +91,19 @@ def read_background(proj_dir):
     return df, ff
 
 def read_projection(filename, df_projection, ff_projection, align_matrix=None):
+    '''
+    Reads and processes a projection image.
+
+    args:
+        filename: File path of the projection image.
+        df_projection: Dark field projection.
+        ff_projection: Flat field projection.
+        align_matrix: Alignment matrix (optional). If provided, the projection image will be aligned using the matrix.
+
+    returns:
+        p: Processed projection image.
+    '''
+
     p = np.array(Image.open(filename), dtype='float32')
     p = (p - df_projection) / (ff_projection - df_projection)
     
@@ -85,6 +120,19 @@ def read_projection_mp(args):
     return i, read_projection(fn, df_projection, ff_projection, align_matrix)
 
 def find_align_matrix(proj_files, df_projection, ff_projection):
+    '''
+    Finds the alignment matrix for projection images.
+
+    args:
+        proj_files: List of projection file paths.
+        df_projection: Dark field projection.
+        ff_projection: Flat field projection.
+
+    returns:
+        align_matrix: Alignment matrix.
+        angles: Array of angles for alignment.
+    '''
+
     n_angles, height, width = len(proj_files), df_projection.shape[0], ff_projection.shape[1]
 
     # load the first and a few last projections
@@ -108,6 +156,19 @@ def find_align_matrix(proj_files, df_projection, ff_projection):
     return align_matrix, angles
 
 def read_aligned(proj_files, df_projection, ff_projection):
+    '''
+    Reads aligned projection images.
+
+    args:
+        proj_files: List of projection file paths.
+        df_projection: Dark field projection.
+        ff_projection: Flat field projection.
+
+    returns:
+        projections: Aligned projection images.
+        angles: Array of angles for the projections.
+    '''
+
     n_angles, height, width = len(proj_files), df_projection.shape[0], ff_projection.shape[1]
 
     align_matrix, angles = find_align_matrix(proj_files, df_projection, ff_projection)
@@ -126,7 +187,7 @@ def read_aligned(proj_files, df_projection, ff_projection):
     return projections, angles
 
 def fft_wavelet_ring_removal(sinogram, level, wname='db5', sigma=1.5):
-    """
+    '''
     Suppress horizontal stripe in a sinogram using the Fourier-Wavelet based
     method by Munch et al. [2]_.
 
@@ -153,7 +214,7 @@ def fft_wavelet_ring_removal(sinogram, level, wname='db5', sigma=1.5):
     ----------
     .. [2] B. Munch, P. Trtik, F. Marone, M. Stampanoni, Stripe and ring artifact removal with
         combined wavelet-Fourier filtering, Optics Express 17(10):8567-8591, 2009.
-    """
+    '''
 
     nrow, ncol = sinogram.shape
 
@@ -192,6 +253,17 @@ def fft_wavelet_ring_removal_mp(args):
     return i, fft_wavelet_ring_removal(sinogram, level)
 
 def ring_removal(projections, adv=False):
+    '''
+    Removes ring artifacts from projections.
+
+    args:
+        projections: Projection images.
+        adv: Advanced ring removal flag. If set to True, Fourier-Wavelet based ring removal will be used.
+
+    returns:
+        Projections with ring artifacts removed.
+    '''
+
     def simple_ring_removal(projections):
         angle_mean = projections.mean(axis=0)
         angle_mean_median = median_filter(angle_mean, size=(1, 11)) # (H, W)
@@ -208,16 +280,58 @@ def ring_removal(projections, adv=False):
         return simple_ring_removal(projections)
 
 def negative_log(projections):
+    '''
+    Computes negative logarithm of projections.
+
+    args:
+        projections: Input projection images.
+
+    returns:
+        Projections after negative logarithm transformation.
+    '''
+
     projections = np.where(projections > 0, projections, ma.array(projections, mask=projections <= 0).min(keepdims=True))
     return -np.log(projections)
 
 def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-10, 10), init_points=50, n_iter=150):
+    '''
+    Finds correct centers for reconstruction using Bayesian Optimization.
+
+    args:
+        projections: Projection images.
+        angles: Array of angles.
+        n_center_sample: Number of center samples.
+        shift_range: Range for center shift.
+        init_points: Optional, defines the number of initial points in Bayesian Optimization. Default value is set to 50.
+        n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 150.
+
+    returns:
+        Corrected centers for each projection.
+    '''
+
     sample_indices = np.linspace(0, projections.shape[1], n_center_sample+2)[1:-1].astype(int)
     sample_sinogram = projections[:, sample_indices, :]
 
     return center_correction(sample_sinogram.transpose(1, 0, 2), sample_indices, projections.shape[1], angles, shift_range, init_points, n_iter)
 
 def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_keypoints=8, shift_range=(-0.015, 0.015), init_points=50, n_iter=400):
+    '''
+    Finds correct angles for reconstruction.
+
+    args:
+        projections: Projection images.
+        angles: Array of angles.
+        center: Center positions.
+        n_angle_sample: Number of angle samples.
+        n_keypoints: Number of keypoints.
+        shift_range: Range for angle shift.
+        init_points: Optional, defines the number of initial points in Bayesian Optimization. Default value is set to 50.
+        n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 300.
+
+    returns:
+        Corrected angles for reconstruction.
+    '''
+
     sample_indices = np.linspace(0, projections.shape[1], n_angle_sample+2)[1:-1].astype(int)
     sample_sinogram = projections[:, sample_indices, :]
 
@@ -227,6 +341,19 @@ def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_ke
     return theta_correction(sample_sinogram.transpose(1, 0, 2), angles, center, n_keypoints, shift_range, init_points, n_iter)
 
 def reconstruct(projections, angles, center=None, value_range=None):
+    '''
+    Reconstructs the 3D volume from projections.
+
+    args:
+        projections: Projection images.
+        angles: Array of angles.
+        center: Center positions. If None, the center will be automatically calculated.
+        value_range: Range of values for normalization. If given, the reconstructed volume will be normalized to [0, 1].
+
+    returns:
+        Reconstructed 3D volume.
+    '''
+
     pad_width = projections.shape[-1] // 4 + 1
     if center is not None: center = center + pad_width
     recon = tomopy.recon(np.pad(projections, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
@@ -247,6 +374,19 @@ def reconstruct(projections, angles, center=None, value_range=None):
     return recon
 
 def find_value_range(projections, angles, center=None, n_range_sample=10):
+    '''
+    Finds value range for reconstruction.
+
+    args:
+        projections: Projection images.
+        angles: Array of angles.
+        center: Center positions.
+        n_range_sample: Number of value range samples.
+
+    returns:
+        Minimum and maximum value range for reconstruction.
+    '''
+
     sample_indices = np.linspace(0, projections.shape[1], n_range_sample+2)[1:-1].astype(int)
     sample_sinogram = projections[:, sample_indices, :]
 
