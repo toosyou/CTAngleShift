@@ -13,6 +13,7 @@ torchvision = "*"
 torchaudio = "*"
 radon-transformation = {editable = true, path = "./Radon-Transformation"}
 xitorch = "*"
+jupyter = "*"
 
 [dev-packages]
 jupyterlab = "*"
