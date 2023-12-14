@@ -6,8 +6,14 @@ from numba import cuda
 @cuda.jit('void(float64[:, :, :], float64, float64[:], float64[:], float64[:, :, :])')
 def cuda_bp_kernel(sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon):
     '''
-        sinogram: (N, n_angles, M) 3d texture
-        recon: (N, M, M) 3d output
+    Compute the backprojection of a tilted sinogram on GPU
+
+    args:
+        sinogram: (N, n_angles, M)
+        ztilt_theta_sin: scalar, the tilt angle of the z axis in radians
+        theta_sin: (n_angles,) sin of the angles in radians
+        theta_cos: (n_angles,) cos of the angles in radians
+        recon: (N, M, M) output reconstruction
     '''
     z, x, y = cuda.grid(3)
     if z >= recon.shape[0] or x >= recon.shape[1] or y >= recon.shape[2]: return
@@ -68,9 +74,14 @@ def rampfilter(size):
 
 def tilted_FBP(sinogram, ztilt_theta, theta, circle=True, filtered=True):
     '''
-        sinogram: (N, n_angles, M)
-        ztilt_theta: scalar
-        theta: (n_angles,)
+    Compute the backprojection of a tilted sinogram
+
+    args:
+        sinogram: (N, n_angles, M) sinogram
+        ztilt_theta: scalar, the tilt angle of the z axis in radians
+        theta: (n_angles,) array of the theta in radians
+        circle: bool, whether to crop the reconstruction to a circle
+        filtered: bool, whether to apply ramp filter
     '''
     
     N, n_angles, M = sinogram.shape
@@ -87,30 +98,22 @@ def tilted_FBP(sinogram, ztilt_theta, theta, circle=True, filtered=True):
         sinogram = np.fft.fft(sinogram, axis=-1) * rampfilter(final_width)
         sinogram = np.real(np.fft.ifft(sinogram, axis=-1))[:, :, :M] 
 
-    # prepare theta
-    theta_sin = np.sin(theta)
-    theta_cos = np.cos(theta)
-
-    # prepare ztilt_theta
-    ztilt_theta_sin = np.sin(ztilt_theta)
-
     # move to device
     sinogram = cuda.to_device(np.ascontiguousarray(sinogram))
-    theta_sin = cuda.to_device(theta_sin)
-    theta_cos = cuda.to_device(theta_cos)
+    theta_sin, theta_cos = cuda.to_device(np.sin(theta)), cuda.to_device(np.cos(theta))
 
     # prepare output
     recon = cuda.device_array((N, M, M))
 
     # prepare grid
     threadsperblock = (1, 32, 32)
-    blockspergrid_x = math.ceil(recon.shape[0] / threadsperblock[0])
-    blockspergrid_y = math.ceil(recon.shape[1] / threadsperblock[1])
-    blockspergrid_z = math.ceil(recon.shape[2] / threadsperblock[2])
+    blockspergrid_x = math.ceil(N / threadsperblock[0])
+    blockspergrid_y = math.ceil(M / threadsperblock[1])
+    blockspergrid_z = math.ceil(M / threadsperblock[2])
     blockspergrid = (blockspergrid_x, blockspergrid_y, blockspergrid_z)
 
     # run kernel
-    cuda_bp_kernel[blockspergrid, threadsperblock](sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon)
+    cuda_bp_kernel[blockspergrid, threadsperblock](sinogram, np.sin(ztilt_theta), theta_sin, theta_cos, recon)
     recon = recon.copy_to_host()
 
     if circle:
