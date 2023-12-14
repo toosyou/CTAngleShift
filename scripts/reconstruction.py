@@ -40,7 +40,7 @@ def read_background(proj_dir):
 
     return df, ff
 
-def read_projection(filename, df_projection, ff_projection):
+def read_normed(filename, df_projection, ff_projection):
     '''
     Reads and processes a projection image.
 
@@ -58,20 +58,37 @@ def read_projection(filename, df_projection, ff_projection):
     
     return p
 
-def read_projection_mp(args):
+def read_normed_mp(args):
     fn, df_projection, ff_projection = args
-    return read_projection(fn, df_projection, ff_projection)
+    return read_normed(fn, df_projection, ff_projection)
 
-def align_projection(projections, align_matrix):
+def align_projection(projections, align_matrix=None, centers=None):
     '''
-    Aligns a projection image inplace using an alignment matrix in stacks.
+    Aligns a projection image inplace using an alignment matrix or centers in stacks.
 
     args:
-        projections: Projection images of shape (N, H, W).
+        projections: Projection images of shape (n_angles, z, M).
 
     returns:
         Aligned projection images.
     '''
+
+    assert align_matrix is not None or centers is not None, 'Either align_matrix or centers should be given.'
+
+    _, z, M = projections.shape
+
+    if align_matrix is None:
+        theta = np.arctan((centers[-1] - centers[0]) / (z - 1))
+        align_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
+                                    [np.sin(theta), np.cos(theta), 0],
+                                    [0, 0, 1]])
+
+        xshift = M / 2 - (align_matrix @ np.array([centers[0], 0, 1]))[0]
+        yshift = -(align_matrix @ np.array([centers[0], 0, 1]))[1]
+        align_matrix[0, 2] = xshift
+        align_matrix[1, 2] = yshift
+        align_matrix = np.linalg.inv(align_matrix)[:2]
+
     STACK_SIZE = 500
     for i in range(0, projections.shape[0], STACK_SIZE):
         end = min(i + STACK_SIZE, projections.shape[0])
@@ -152,8 +169,8 @@ def find_align_matrix(proj_files, df_projection, ff_projection):
     # load the first and a few last projections
     hcut, wcut = height // 4, width // 4
 
-    first = read_projection(proj_files[0], df_projection, ff_projection)
-    lasts = [read_projection(proj_files[-1 - i], df_projection, ff_projection) for i in range(3)]
+    first = read_normed(proj_files[0], df_projection, ff_projection)
+    lasts = [read_normed(proj_files[-1 - i], df_projection, ff_projection) for i in range(3)]
     align_result = [align(first, np.flip(i_last, axis=-1)) for i_last in lasts] # [(warp_matrix, aligned_image), ...]
 
     diffs = [np.abs(first - aligned_image)[hcut: -hcut, wcut: -wcut].mean() for _, aligned_image in align_result]
@@ -169,7 +186,7 @@ def find_align_matrix(proj_files, df_projection, ff_projection):
     
     return align_matrix, angles
 
-def read_aligned(proj_files, df_projection, ff_projection):
+def read_projections(proj_files, df_projection, ff_projection, align=False):
     '''
     Reads aligned projection images.
 
@@ -177,6 +194,7 @@ def read_aligned(proj_files, df_projection, ff_projection):
         proj_files: List of projection file paths.
         df_projection: Dark field projection.
         ff_projection: Flat field projection.
+        align: Whether to align the projection images. (default: False)
 
     returns:
         projections: Aligned projection images.
@@ -184,8 +202,7 @@ def read_aligned(proj_files, df_projection, ff_projection):
     '''
 
     n_angles, height, width = len(proj_files), df_projection.shape[0], ff_projection.shape[1]
-
-    align_matrix, angles = find_align_matrix(proj_files, df_projection, ff_projection)
+    angles = np.linspace(0, np.pi, n_angles)
 
     # number of process
     num_processes = mp.cpu_count()
@@ -193,10 +210,12 @@ def read_aligned(proj_files, df_projection, ff_projection):
 
     with Pool(num_processes) as pool:
         args_list = [(fn, df_projection, ff_projection) for i, fn in enumerate(proj_files)]
-        for i, p in enumerate(tqdm(pool.imap(read_projection_mp, args_list), total=n_angles, desc='Reading projections')):
+        for i, p in enumerate(tqdm(pool.imap(read_normed_mp, args_list), total=n_angles, desc='Reading projections')):
             projections[i] = p
 
-    projections = align_projection(projections, align_matrix)
+    if align:
+        align_matrix, angles = find_align_matrix(proj_files, df_projection, ff_projection)
+        projections = align_projection(projections, align_matrix)
 
     return projections, angles
 
@@ -307,7 +326,7 @@ def negative_log(projections):
     projections = np.where(projections > 0, projections, ma.array(projections, mask=projections <= 0).min(keepdims=True))
     return -np.log(projections)
 
-def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-10, 10), init_points=50, n_iter=150):
+def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-20, 20), init_points=50, n_iter=150):
     '''
     Finds correct centers for reconstruction using Bayesian Optimization.
 
@@ -438,36 +457,39 @@ def main():
     logger.info("Reading background")
     df_projection, ff_projection = read_background(args.proj_dir)
 
-    logger.info("Reading and aligning projections")
-    projections, angles = read_aligned(proj_files, df_projection, ff_projection)
+    logger.info("Reading projections")
+    projections, angles = read_projections(proj_files, df_projection, ff_projection, align=not args.center_shift)
 
-    center = None
+    centers = None
     if args.angle_shift and args.center_shift:
         for i in range(3):
             logger.info("Angle and center shift correction iteration {}/3".format(i))
-            angles = find_correct_angles(projections, angles, center, init_points=30, n_iter=150)
-            center = find_correct_centers(projections, angles, init_points=30, n_iter=100)
+            angles = find_correct_angles(projections, angles, centers, init_points=30, n_iter=150)
+            centers = find_correct_centers(projections, angles, init_points=30, n_iter=100)
     elif args.center_shift:
         logger.info("Finding correct center")
-        center = find_correct_centers(projections, angles)
+        centers = find_correct_centers(projections, angles)
     elif args.angle_shift:
         logger.info("Finding correct angles")
         angles = find_correct_angles(projections, angles)
+
+    if args.center_shift:
+        logger.info("Aligning projections using found centers")
+        projections = align_projection(projections, centers=centers)
 
     if args.ring_removal != 0:
         logger.info("Performing ring removal")
         projections = ring_removal(projections, args.ring_removal == 2)
 
     logger.info("Finding value range")
-    vmin, vmax = find_value_range(projections, angles, center)
+    vmin, vmax = find_value_range(projections, angles)
 
     # batch reconstruction
     logger.info("Starting batch reconstruction")
     for i in tqdm(range(0, projections.shape[1], args.batch_size), desc='Reconstructing'):
         end = min(i + args.batch_size, projections.shape[1])
         recon = reconstruct(negative_log(projections[:, i: end, :]), 
-                            angles, 
-                            center[i: end] if center is not None else None, 
+                            angles, None,
                             (vmin, vmax))
         recon = (recon * 65535).astype('uint16')
 
