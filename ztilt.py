@@ -3,10 +3,11 @@ import numpy as np
 
 from numba import cuda
 
-@cuda.jit('void(float64[:, :, :], float64, float64[:], float64[:], float64[:, :, :], boolean)')
-def cuda_bp_kernel(sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon, circle=True):
+@cuda.jit('void(float64[:, :, :], float64, float64[:], float64[:], float64[:, :, :], boolean, boolean)')
+def cuda_bp_kernel(sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon, circle=True, only_middle=False):
     '''
-    Compute the backprojection of a tilted sinogram on GPU
+    Compute the backprojection of a tilted sinogram on GPU. 
+    The sinogram is assumed to be aligned properly so that the center of rotation is M / 2.
 
     args:
         sinogram: (N, n_angles, M)
@@ -14,9 +15,12 @@ def cuda_bp_kernel(sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon, circl
         theta_sin: (n_angles,) sin of the angles in radians
         theta_cos: (n_angles,) cos of the angles in radians
         recon: (N, M, M) output reconstruction
+        circle: bool, whether to crop the reconstruction to a circle
+        only_middle: bool, whether to only compute the middle layer of the reconstruction
     '''
     z, x, y = cuda.grid(3)
     if z >= recon.shape[0] or x >= recon.shape[1] or y >= recon.shape[2]: return
+    if only_middle and z != recon.shape[0] // 2: return
 
     N, n_angles, M = sinogram.shape
 
@@ -53,74 +57,7 @@ def cuda_bp_kernel(sinogram, ztilt_theta_sin, theta_sin, theta_cos, recon, circl
 
             # update the reconstruction
             recon[z, x, y] += c
-
-def rampfilter(size):
-    n = np.concatenate((np.arange(1, size / 2 + 1, 2, dtype=int),
-                        np.arange(size / 2 - 1, 0, -2, dtype=int)))
-    f = np.zeros(size)
-    f[0] = 0.25
-    f[1::2] = -1 / (np.pi * n) ** 2
-    return 2 * np.real(np.fft.fft(f))
-
-def tilted_FBP(sinogram, ztilt_theta, theta, circle=True, filtered=True):
-    '''
-    Compute the backprojection of a tilted sinogram
-
-    args:
-        sinogram: (N, n_angles, M) sinogram
-        ztilt_theta: scalar, the tilt angle of the z axis in radians
-        theta: (n_angles,) array of the theta in radians
-        circle: bool, whether to crop the reconstruction to a circle
-        filtered: bool, whether to apply ramp filter
-    '''
-    
-    N, n_angles, M = sinogram.shape
-
-    if filtered:
-        # padding values
-        final_width = max(64, int(2 ** np.ceil(np.log2(2 * M))))
-        pad_width = final_width - M
-
-        # pad sinogram
-        sinogram = np.pad(sinogram, [(0, 0), (0, 0), (0, pad_width)], mode='constant', constant_values=0)
-
-        # apply filter
-        sinogram = np.fft.fft(sinogram, axis=-1) * rampfilter(final_width)
-        sinogram = np.real(np.fft.ifft(sinogram, axis=-1))[:, :, :M] 
-
-    # Apply CUDA stream
-    stream = cuda.stream()  # Create a new CUDA stream
-    sinogram = cuda.to_device(np.ascontiguousarray(sinogram), stream)
-    theta_sin, theta_cos = cuda.to_device(np.sin(theta), stream), cuda.to_device(np.cos(theta), stream)
-
-    # prepare output
-    recon = cuda.device_array((N, M, M), stream=stream)
-
-    # prepare grid
-    threadsperblock = (1, 32, 32)
-    blockspergrid_x = math.ceil(N / threadsperblock[0])
-    blockspergrid_y = math.ceil(M / threadsperblock[1])
-    blockspergrid_z = math.ceil(M / threadsperblock[2])
-    blockspergrid = (blockspergrid_x, blockspergrid_y, blockspergrid_z)
-
-    # run kernel
-    cuda_bp_kernel[blockspergrid, threadsperblock, stream](sinogram, np.sin(ztilt_theta), theta_sin, theta_cos, recon)
-    # This will initiate the copy back to host, but will return control to CPU immediately
-    recon_host_future = recon.copy_to_host(stream=stream)
-
-    # Make sure we wait for the stream to complete before accessing on the host
-    stream.synchronize()
-
-    # Now it's safe to access
-    recon = recon_host_future
-
-    if circle:
-        # crop to circle for the last two dimensions
-        center = M / 2
-        x, y = np.meshgrid(np.arange(M) - center, np.arange(M) - center)
-        recon[:, ~(x ** 2 + y ** 2 <= center ** 2)] = 0
-
-    return recon
+    recon[z, x, y] *= math.pi / (2 * n_angles)
     
 class TiltedFBP:
     def __init__(self, sinogram, circle=True, filtered=True):
@@ -131,6 +68,7 @@ class TiltedFBP:
             sinogram: (N, n_angles, M) sinogram
             circle: bool, whether to crop the reconstruction to a circle
             filtered: bool, whether to apply ramp filter
+            pad: bool, whether to pad the sinogram before reconstruction
         '''
         self.N, self.n_angles, self.M = sinogram.shape
 
@@ -150,29 +88,52 @@ class TiltedFBP:
 
         self.to_device()
 
+    @staticmethod
+    def rampfilter(size):
+        n = np.concatenate((np.arange(1, size / 2 + 1, 2, dtype=int),
+                            np.arange(size / 2 - 1, 0, -2, dtype=int)))
+        f = np.zeros(size)
+        f[0] = 0.25
+        f[1::2] = -1 / (np.pi * n) ** 2
+        return 2 * np.real(np.fft.fft(f))
+
     def apply_filter(self):
         # padding values
-        final_width = max(64, int(2 ** np.ceil(np.log2(2 * self.M))))
-        pad_width = final_width - self.M
+        final_width = max(64, int(2 ** np.ceil(np.log2(2 * (self.M * 1.5)))))
+        left_pad_width = self.M // 4 + 1
+        right_pad_width = final_width - self.M - left_pad_width
 
         # pad sinogram
-        self.sinogram = np.pad(self.sinogram, [(0, 0), (0, 0), (0, pad_width)], mode='constant', constant_values=0)
+        self.sinogram = np.pad(self.sinogram, [(0, 0), (0, 0), (left_pad_width, right_pad_width)], mode='edge')
 
         # apply filter
-        self.sinogram = np.fft.fft(self.sinogram, axis=-1) * rampfilter(final_width)
-        self.sinogram = np.real(np.fft.ifft(self.sinogram, axis=-1))[:, :, :self.M]
+        self.sinogram = np.fft.fft(self.sinogram, axis=-1) * self.rampfilter(final_width)
+        self.sinogram = np.real(np.fft.ifft(self.sinogram, axis=-1))[:, :, left_pad_width: left_pad_width+self.M]
 
     def to_device(self):
         self.stream = cuda.stream()  # Create a new CUDA stream
         self.sinogram = cuda.to_device(np.ascontiguousarray(self.sinogram), self.stream)
         self.recon = cuda.device_array((self.N, self.M, self.M), stream=self.stream)
 
-    def run(self, ztilt_theta, theta, copy_to_host=True):
+    def run(self, ztilt_theta, theta, value_range=None, copy_to_host=True, only_middle=False):
+        '''
+        Compute the backprojection of a tilted sinogram
+
+        args:
+            ztilt_theta: scalar, the tilt angle of the z axis in radians
+            theta: (n_angles,) array of the theta in radians
+            value_range: A tuple of (low, high) to indicate the range of values. If None, the range is set to the min and max of the reconstruction.
+            copy_to_host: bool, whether to copy the reconstruction back to host
+            only_middle: bool, whether to only compute the middle layer of the reconstruction
+
+        return:
+            recon: (N, M, M) reconstructed images
+        '''
         theta_sin = cuda.to_device(np.sin(theta), self.stream)
         theta_cos = cuda.to_device(np.cos(theta), self.stream)
 
         # run kernel
-        cuda_bp_kernel[self.blockspergrid, self.threadsperblock, self.stream](self.sinogram, np.sin(ztilt_theta), theta_sin, theta_cos, self.recon, self.circle)
+        cuda_bp_kernel[self.blockspergrid, self.threadsperblock, self.stream](self.sinogram, np.sin(ztilt_theta), theta_sin, theta_cos, self.recon, self.circle, only_middle)
         # This will initiate the copy back to host, but will return control to CPU immediately
         if copy_to_host:
             recon_host_future = self.recon.copy_to_host(stream=self.stream)
@@ -180,11 +141,66 @@ class TiltedFBP:
         # Make sure we wait for the stream to complete before accessing on the host
         self.stream.synchronize()
 
-        # Now it's safe to access
         if copy_to_host:
-            self.recon = recon_host_future
-
+            if value_range is not None:
+                vmin, vmax = value_range
+                recon_host_future = (recon_host_future - vmin) / (vmax - vmin)
+                return np.clip(recon_host_future, 0, 1)
+            return recon_host_future
         return self.recon
+
+def ztilt_correction(sinogram, theta, ztilt_range=(-0.0017, 0.0017), init_points=10, n_iter=50):
+    '''
+    Correct ztilt angle in sinogram.
+
+    args:
+        sinogram: (K, N, n_angles, M)
+        theta: (n_angles,) array of the original theta in radians.
+        ztilt_range: A tuple of (low, high) to indicate the range of ztilt angle in radians.
+        init_points: Optional, defines the number of initial points in Bayesian Optimization. Default value is set to 10.
+        n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 100.
+
+    return:
+        corrected_tilt: scalar of corrected tilt angle in radians
+    '''
+    import cupy as cp
+    from cupyx.scipy.signal import convolve2d
+
+    from bayes_opt import BayesianOptimization
+
+    def loss(ztilt):
+        center_recon = [tfbp.run(ztilt, theta, copy_to_host=False, only_middle=True) for tfbp in tilted_fbps]
+
+        kernel = cp.array([[1, 0, -1],
+                            [2, 0, -2],
+                            [1, 0, -1],
+                            ], dtype=cp.float32)
+    
+        center_recon = [cp.asarray(r) for r in center_recon]
+        center_recon = [r[N // 2] for r in center_recon]
+
+        acutances = [((convolve2d(r, kernel, mode='valid') ** 2 + convolve2d(r, kernel.T, mode='valid') ** 2) ** 0.5).mean().get() for r in center_recon]
+        return -np.mean(acutances)
+
+    K, N, n_angles, M = sinogram.shape
+
+    tilted_fbps = [TiltedFBP(sino) for sino in sinogram]
+    
+    # Bounded region of parameter space
+    pbounds = {
+        'ztilt': ztilt_range,
+    }
+    optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1, allow_duplicate_points=True)
+
+    # probe the assumed center and theta
+    optimizer.probe({'ztilt': 0})
+
+    optimizer.maximize(
+        init_points = init_points,
+        n_iter = n_iter,
+    )
+
+    return optimizer.max['params']['ztilt']
 
 if __name__ == '__main__':
     import time
