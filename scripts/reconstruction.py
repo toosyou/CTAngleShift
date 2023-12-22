@@ -326,7 +326,7 @@ def negative_log(projections):
     projections = np.where(projections > 0, projections, ma.array(projections, mask=projections <= 0).min(keepdims=True))
     return -np.log(projections)
 
-def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-20, 20), init_points=50, n_iter=150):
+def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-25, 25), init_points=50, n_iter=150):
     '''
     Finds correct centers for reconstruction using Bayesian Optimization.
 
@@ -401,8 +401,7 @@ def reconstruct(projections, angles, center=None, value_range=None):
     if value_range is not None:
         vmin, vmax = value_range
         recon = (recon - vmin) / (vmax - vmin)
-        recon[recon < 0] = 0
-        recon[recon > 1] = 1
+        recon = np.clip(recon, 0, 1)
 
     return recon
 
@@ -460,11 +459,12 @@ def main():
     logger.info("Reading projections")
     projections, angles = read_projections(proj_files, df_projection, ff_projection, align=not args.center_shift)
 
+    original_angles = angles.copy()
     centers = None
     if args.angle_shift and args.center_shift:
         for i in range(3):
             logger.info("Angle and center shift correction iteration {}/3".format(i))
-            angles = find_correct_angles(projections, angles, centers, init_points=30, n_iter=150)
+            angles = find_correct_angles(projections, original_angles, centers, init_points=30, n_iter=150)
             centers = find_correct_centers(projections, angles, init_points=30, n_iter=100)
     elif args.center_shift:
         logger.info("Finding correct center")
