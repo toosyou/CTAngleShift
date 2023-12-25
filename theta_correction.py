@@ -8,6 +8,12 @@ from cupyx.scipy.signal import convolve2d
 
 from bayes_opt import BayesianOptimization
 
+SOBAL_KERNEL = cp.array([
+                    [1, 0, -1],
+                    [2, 0, -2],
+                    [1, 0, -1],
+                ], dtype=cp.float32)
+
 @cp.fuse()
 def l2_sum(x, y):
     return cp.sum((x ** 2 + y ** 2) ** 0.5)
@@ -22,19 +28,13 @@ def acutance(images):
     return:
         acutance: scalar, the mean of the gradient magnitude
     '''
-    # sobal kernel
-    kernel = cp.array([
-                    [1, 0, -1],
-                    [2, 0, -2],
-                    [1, 0, -1],
-                ], dtype=cp.float32)
-
     N, H, W = images.shape
+
     images = cp.array(images, dtype=cp.float32)
     gradient_magnitude = 0
     for r in images:
-        x = convolve2d(r, kernel, mode='valid')
-        y = convolve2d(r, kernel.T, mode='valid')
+        x = convolve2d(r, SOBAL_KERNEL, mode='valid')
+        y = convolve2d(r, SOBAL_KERNEL.T, mode='valid')
 
         gradient_magnitude += l2_sum(x, y).get() / (H * W)
 
@@ -66,7 +66,7 @@ def padded_recon(sinogram, theta, center, pad_width):
     recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
     return recon
 
-def center_correction(sinogram, z_indices, total_z, theta, center_range, init_points=50, n_iter=300, probe_center=None):
+def center_correction(sinogram, z_indices, total_z, theta, center_range, init_points=50, n_iter=300):
     '''
     The function center_correction() uses Bayesian Optimization to correct shifts in the center of a given sinogram.
 
@@ -115,7 +115,7 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
     center_shifts = interp1d([z_indices[0], z_indices[-1]], [start_center, end_center], kind='linear', fill_value='extrapolate')(np.arange(total_z))
     return center_shifts + width / 2
 
-def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_points=50, n_iter=300, probe_theta=None):
+def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_points=50, n_iter=300):
     '''
     Correct theta shift in sinogram.
 
