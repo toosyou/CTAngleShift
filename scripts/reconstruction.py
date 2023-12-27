@@ -101,7 +101,7 @@ def align_projection(projections, align_matrix=None, centers=None):
 
     return projections
 
-def find_align_matrix(proj_files, df_projection, ff_projection):
+def find_align_matrix(projections, df_projection, ff_projection):
     '''
     Finds the alignment matrix for projection images.
 
@@ -164,13 +164,13 @@ def find_align_matrix(proj_files, df_projection, ff_projection):
 
         return warp_matrix, im2_aligned
 
-    n_angles, height, width = len(proj_files), df_projection.shape[0], ff_projection.shape[1]
+    n_angles, height, width = projections.shape
 
     # load the first and a few last projections
     hcut, wcut = height // 4, width // 4
 
-    first = read_normed(proj_files[0], df_projection, ff_projection)
-    lasts = [read_normed(proj_files[-1 - i], df_projection, ff_projection) for i in range(3)]
+    first = projections[0]
+    lasts = projections[-3:][::-1]
     align_result = [align(first, np.flip(i_last, axis=-1)) for i_last in lasts] # [(warp_matrix, aligned_image), ...]
 
     diffs = [np.abs(first - aligned_image)[hcut: -hcut, wcut: -wcut].mean() for _, aligned_image in align_result]
@@ -214,7 +214,7 @@ def read_projections(proj_files, df_projection, ff_projection, align=False):
             projections[i] = p
 
     if align:
-        align_matrix, angles = find_align_matrix(proj_files, df_projection, ff_projection)
+        align_matrix, angles = find_align_matrix(projections, df_projection, ff_projection)
         projections = align_projection(projections, align_matrix)
 
     return projections, angles
@@ -326,7 +326,7 @@ def negative_log(projections):
     projections = np.where(projections > 0, projections, ma.array(projections, mask=projections <= 0).min(keepdims=True))
     return -np.log(projections)
 
-def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-25, 25), init_points=50, n_iter=150):
+def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-10, 10), init_points=50, n_iter=150):
     '''
     Finds correct centers for reconstruction using Bayesian Optimization.
 

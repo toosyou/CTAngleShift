@@ -16,7 +16,7 @@ void bp_kernel(const cudaTextureObject_t sinogram,
                          
     if (x >= M || y >= M) return;
 
-    float r = (float)M / 2.0f;
+    float r = (float)(M-1) / 2.0f;
     float x_centered = x - r;
     float y_centered = y - r;
     
@@ -25,10 +25,10 @@ void bp_kernel(const cudaTextureObject_t sinogram,
 
     float value = 0.;
     for (int i = 0; i < n_angles; i++){
-        float sy = x_centered * theta_cos[i] - y_centered * theta_sin[i] + r + center_offset;
-        value += tex2D<float>(sinogram, sy + 0.5f, i + 0.5f);
+        const float sy = x_centered * theta_cos[i] - y_centered * theta_sin[i] + r + center_offset;
+        value += tex2D<float>(sinogram, sy + 0.5f, (float)i + 0.5f);
     }
-    recon[x * M + y] = value * (float)M / (2.0f * (float)n_angles);
+    recon[x * M + y] = value / (2.0f * (float)n_angles);
 }        
 ''', 'bp_kernel')
 
@@ -57,10 +57,11 @@ class FBP:
         sinogram_tex = cp.array(sinogram, dtype=cp.float32)
 
         resource_desc = cp.cuda.texture.ResourceDescriptor(cp.cuda.runtime.cudaResourceTypePitch2D,
-                                                           arr=sinogram_tex, chDesc=channel_desc, width=self.M, height=self.n_angles, pitchInBytes=self.M // 128 * 128 * 4)
+                                                           arr=sinogram_tex, chDesc=channel_desc, 
+                                                           width=self.M, height=self.n_angles, pitchInBytes=self.M // 128 * 128 * 4)
 
-        texture_desc = cp.cuda.texture.TextureDescriptor([cp.cuda.runtime.cudaAddressModeClamp, 
-                                                            cp.cuda.runtime.cudaAddressModeClamp],
+        texture_desc = cp.cuda.texture.TextureDescriptor([cp.cuda.runtime.cudaAddressModeBorder, 
+                                                            cp.cuda.runtime.cudaAddressModeBorder],
                                                          cp.cuda.runtime.cudaFilterModeLinear,
                                                          cp.cuda.runtime.cudaReadModeElementType,
                                                          0)
@@ -97,41 +98,42 @@ class FBP:
         texture_readback((self.n_angles // 32, self.M // 32), (32, 32), (self.sinograms[0], self.n_angles, self.M, test_sinogram))
         return test_sinogram.get()
 
-    def run(self, theta, centers=None):
-        if centers is None: center_offset = [0.0] * self.N
-        elif isinstance(centers, int): center_offset = [centers - self.M // 2] * self.N
-        else: center_offset = [c - self.M // 2 for c in centers]
+    def run(self, theta, center_offset=None, to_host=True):
+        if center_offset is None: center_offset = [0.0] * self.N
+        elif np.isscalar(center_offset): center_offset = [center_offset] * self.N
 
         theta = cp.array(theta, dtype=cp.float32)
-        theta_sin = cp.sin(theta)
-        theta_cos = cp.cos(theta)
+        theta_sin, theta_cos = cp.sin(theta), cp.cos(theta)
 
         recons = list()
         for sinogram, offset in zip(self.sinograms, center_offset):
             recon = cp.zeros((self.M, self.M), dtype=cp.float32)
-            bp_kernel((self.M // 32, self.M // 32), (32, 32), (sinogram, 
-                                                            theta_sin, theta_cos, offset, 
-                                                            self.n_angles, self.M, recon))
+            grid_size = np.ceil(self.M / 32).astype(int)
+            bp_kernel((grid_size, grid_size), (32, 32), 
+                      (sinogram, theta_sin, theta_cos, 
+                       np.float32(offset), self.n_angles, self.M, recon))
             recons.append(recon)
 
         recons = cp.stack(recons)
-        return recons.get()
-
+        if to_host: recons = recons.get()
+        return recons
+    
 if __name__ == "__main__":
     sample_sinogram = np.load('./notebooks/sample_sinogram.npy')
     n_angles, N, M = sample_sinogram.shape
     sample_sinogram = np.swapaxes(sample_sinogram, 0, 1) # (N, n_angles, M)
     angles = np.linspace(0, np.pi, n_angles)
-    center = None
+    center = M // 2 - 18
     pad_width = M // 4 + 1
 
     fbp = FBP(sample_sinogram)
-    recon = fbp.run(angles)
+    recon = fbp.run(angles, center)
 
     print(recon.shape)
 
     import matplotlib.pyplot as plt
 
+    plt.figure(figsize=(10, 10))
     plt.imshow(recon[0], cmap='gray')
     plt.axis('off')  # to hide the axis
     plt.savefig('recon.png', bbox_inches='tight', pad_inches=0)

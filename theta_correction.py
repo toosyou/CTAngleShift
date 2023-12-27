@@ -8,6 +8,8 @@ from cupyx.scipy.signal import convolve2d
 
 from bayes_opt import BayesianOptimization
 
+from cuda_recon import FBP
+
 SOBAL_KERNEL = cp.array([
                     [1, 0, -1],
                     [2, 0, -2],
@@ -30,16 +32,16 @@ def acutance(images):
     '''
     N, H, W = images.shape
 
-    images = cp.array(images, dtype=cp.float32)
+    images = cp.array(images, dtype=cp.float32, copy=False)
     gradient_magnitude = 0
     for r in images:
         x = convolve2d(r, SOBAL_KERNEL, mode='valid')
         y = convolve2d(r, SOBAL_KERNEL.T, mode='valid')
 
-        gradient_magnitude += l2_sum(x, y).get() / (H * W)
+        gradient_magnitude += l2_sum(x, y).get()
 
     # mean of the gradient magnitude
-    return gradient_magnitude / len(images)
+    return gradient_magnitude / (N * H * W)
 
 def padded_recon(sinogram, theta, center, pad_width):
     '''
@@ -85,16 +87,17 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
     def loss(start_center, end_center):
         X = [z_indices[0], z_indices[-1]]
         y = [start_center, end_center]
-        center = interp1d(X, y, kind='linear')(z_indices) + width / 2
-        return -acutance(padded_recon(sinogram, theta, center, pad_width))
+        center_offset = interp1d(X, y, kind='linear')(z_indices)
+        return -acutance(fbp.run(theta, center_offset, to_host=False))
         
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
     assumed_theta, n_angles, width = theta, len(theta), sinogram.shape[2]
-    pad_width = width // 4 + 1
     
+    fbp = FBP(sinogram)
+
     # Bounded region of parameter space
     pbounds = {
         'start_center': center_range,
@@ -140,15 +143,17 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
 
     def loss(**args):
         theta = interp_theta(np.array(list(args.values())))
-        return -acutance(padded_recon(sinogram, theta, center, pad_width))
+        return -acutance(fbp.run(theta, center_offset, to_host=False))
     
     # make sure sinogram is 3D
     if len(sinogram.shape) == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
     assumed_theta, n_angles, width = theta, len(theta), sinogram.shape[2]
-    pad_width = width // 4 + 1
-    
+    center_offset = 0 if center is None else center - width / 2
+
+    fbp = FBP(sinogram)
+
     # Bounded region of parameter space
     pbounds = {'input' + str(i): shift_range for i in range(n_keypoints)}
     optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1, allow_duplicate_points=True)
