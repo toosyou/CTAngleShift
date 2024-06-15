@@ -7,6 +7,9 @@ import cupy as cp
 from cupyx.scipy.signal import convolve2d
 
 from bayes_opt import BayesianOptimization
+from bayes_opt import UtilityFunction
+
+from tqdm import tqdm
 
 from cuda_recon import FBP
 
@@ -19,6 +22,39 @@ SOBAL_KERNEL = cp.array([
 @cp.fuse()
 def l2_sum(x, y):
     return cp.sum((x ** 2 + y ** 2) ** 0.5)
+
+class CircularAcutance:
+    def __init__(self, size, n_sectors=6, auxiliary_ratio=0.1):
+        self.size = size
+        self.n_sectors = n_sectors
+
+        gridx, gridy = cp.meshgrid(cp.arange(size), cp.arange(size))
+        theta = cp.arctan2(gridy - (size-1) / 2, gridx - (size-1) / 2)
+        
+        sectors = cp.floor((theta + cp.pi) / (2 * cp.pi / n_sectors))
+        sector_masks = [sectors == i for i in range(n_sectors)]
+        self.weights = [mask * (1 - auxiliary_ratio) + auxiliary_ratio for mask in sector_masks]
+
+    @cp.fuse()
+    @staticmethod
+    def l2(x, y):
+        return (x ** 2 + y ** 2) ** 0.5
+
+    def __call__(self, images):
+        N, H, W = images.shape
+
+        images = cp.array(images, dtype=cp.float32, copy=False)
+        gradient_magnitude = np.zeros((self.n_sectors, ))
+        for r in images:
+            x = convolve2d(r, SOBAL_KERNEL, mode='same')
+            y = convolve2d(r, SOBAL_KERNEL.T, mode='same')
+
+            gm = self.l2(x, y)
+
+            for i in range(self.n_sectors):
+                gradient_magnitude[i] += cp.sum(gm * self.weights[i]).get()
+
+        return gradient_magnitude / (N * H * W) * self.n_sectors
 
 def acutance(images):
     '''
@@ -76,7 +112,7 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
         sinogram: (N, n_angles, M) The z indices in the sinogram should be provided in ascending order.
         z_indices: (N,) The z indices of the images in the sinogram, starting from 0.
         total_z: Integer value giving the total number of z slices.
-        theta: (n_angles,) The original theta value in radians.
+        theta: (n_sections, n_angles) or (n_angles,) The original theta value in radians.
         center_range: A tuple (low, high) to indicates the range of the center shift.
         init_points: Optional, defines the number of initial points in Bayesian Optimization. Default value is set to 50.
         n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 300.
@@ -91,10 +127,10 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
         return -acutance(fbp.run(theta, center_offset, to_host=False))
         
     # make sure sinogram is 3D
-    if len(sinogram.shape) == 2:
+    if sinogram.ndim == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
-    assumed_theta, n_angles, width = theta, len(theta), sinogram.shape[2]
+    N, n_angles, width = sinogram.shape
     
     fbp = FBP(sinogram)
 
@@ -115,20 +151,20 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
 
     # interpolate the center shift for each z slice
     start_center, end_center = optimizer.max['params']['start_center'], optimizer.max['params']['end_center']
-    center_shifts = interp1d([z_indices[0], z_indices[-1]], [start_center, end_center], kind='linear', fill_value='extrapolate')(np.arange(total_z))
+    center_shifts = interp1d([z_indices[0], z_indices[-1]], [start_center, end_center], kind='linear', fill_value=np.nan if total_z == 1 else 'extrapolate')(np.arange(total_z))
     return center_shifts + width / 2
 
-def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_points=50, n_iter=300):
+def theta_correction(sinogram, assumed_theta, center, n_keypoints, shift_range, n_sectors=1, n_iter=50):
     '''
     Correct theta shift in sinogram.
 
     args:
         sinogram: (N, n_angles, M)
-        theta: (n_angles,) array of the original theta in radians.
+        assumed_theta: (n_angles, ) array of the original theta in radians.
         center: (N, ) giving the center of rotation, if None, it is automatically calculated.
         n_keypoints: Integer value giving the number of keypoints.
         shift_range: A tuple of (low, high) to indicate the range of shift in radians.
-        init_points: Optional, defines the number of initial points in Bayesian Optimization. Default value is set to 50.
+        n_sectors: Integer value giving the number of sectors. Default value is set to 6.
         n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 300.
 
     return:
@@ -140,30 +176,46 @@ def theta_correction(sinogram, theta, center, n_keypoints, shift_range, init_poi
         '''
         f = interp1d(np.linspace(0, n_angles-1, n_keypoints), keypoints, kind='cubic')
         return f(np.arange(n_angles)) + assumed_theta
-
-    def loss(**args):
-        theta = interp_theta(np.array(list(args.values())))
-        return -acutance(fbp.run(theta, center_offset, to_host=False))
+    
+    def calcualte_acutance(keypoints):
+        '''
+        Calculate acutance of a given theta.
+        '''
+        keypoints = np.array([keypoints[f'input{i}'] for i in range(n_keypoints)])
+        theta = interp_theta(keypoints)
+        return circular_acutance(fbp.run(theta, center_offset, to_host=False)) * -1
     
     # make sure sinogram is 3D
-    if len(sinogram.shape) == 2:
+    if sinogram.ndim == 2:
         sinogram = np.array(sinogram)[np.newaxis, ...]
 
-    assumed_theta, n_angles, width = theta, len(theta), sinogram.shape[2]
+    assumed_theta = np.array(assumed_theta).reshape(-1)
+
+    N, n_angles, width = sinogram.shape
     center_offset = 0 if center is None else center - width / 2
 
-    fbp = FBP(sinogram)
+    fbp, circular_acutance = FBP(sinogram), CircularAcutance(width, n_sectors=n_sectors)
 
     # Bounded region of parameter space
     pbounds = {'input' + str(i): shift_range for i in range(n_keypoints)}
-    optimizer = BayesianOptimization(f=loss, pbounds=pbounds, verbose=1, allow_duplicate_points=True)
 
-    # probe the assumed theta
-    optimizer.probe(params={'input' + str(i): 0 for i in range(n_keypoints)})
+    optimizers = [BayesianOptimization(f=None, pbounds=pbounds, verbose=1, allow_duplicate_points=True) for _ in range(n_sectors)]
 
-    optimizer.maximize(
-        init_points = init_points,
-        n_iter = n_iter,
-    )
+    # probe the assumed center and theta
+    probe_params = {'input' + str(i): 0 for i in range(n_keypoints)}
+    for optimizer, probe_loss in zip(optimizers, calcualte_acutance(probe_params)):
+        optimizer.register(params=probe_params, target=probe_loss)
 
-    return interp_theta(np.array(list(optimizer.max['params'].values())))
+    utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
+
+    for _ in (pbar := tqdm(range(n_iter), desc='theta correction - loss: -')):
+        suggestions = [optimizer.suggest(utility) for optimizer in optimizers]
+        losses = np.array([calcualte_acutance(suggestion) for suggestion in suggestions])
+
+        for i, optimizer in enumerate(optimizers):
+            for suggestion, loss in zip(suggestions, losses):
+                optimizer.register(params=suggestion, target=loss[i])
+        
+        pbar.set_description(f'theta correction - loss: {losses.sum() / n_sectors:.6f}')
+
+    return np.array([interp_theta(np.array(list(optimizer.max['params'].values()))) for optimizer in optimizers])

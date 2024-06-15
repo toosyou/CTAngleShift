@@ -21,6 +21,8 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from theta_correction import theta_correction, center_correction
 
+from cuda_recon import FBP
+
 def read_background(proj_dir):
     '''
     Reads background images from a directory.
@@ -147,7 +149,7 @@ def find_align_matrix(projections, df_projection, ff_projection):
 
         # Specify the threshold of the increment
         
-        termination_eps = 1e-10
+        termination_eps = 1e-8
 
         # Define termination criteria
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
@@ -347,7 +349,7 @@ def find_correct_centers(projections, angles, n_center_sample=5, shift_range=(-1
 
     return center_correction(sample_sinogram.transpose(1, 0, 2), sample_indices, projections.shape[1], angles, shift_range, init_points, n_iter)
 
-def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_keypoints=8, shift_range=(-0.015, 0.015), init_points=50, n_iter=400):
+def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_keypoints=8, shift_range=(-0.015, 0.015), n_sectors=6, n_iter=50):
     '''
     Finds correct angles for reconstruction.
 
@@ -371,14 +373,14 @@ def find_correct_angles(projections, angles, center=None, n_angle_sample=5, n_ke
     if center is not None:
         center = center[sample_indices]
 
-    return theta_correction(sample_sinogram.transpose(1, 0, 2), angles, center, n_keypoints, shift_range, init_points, n_iter)
+    return theta_correction(sample_sinogram.transpose(1, 0, 2), angles, center, n_keypoints, shift_range, n_sectors, n_iter)
 
 def reconstruct(projections, angles, center=None, value_range=None):
     '''
     Reconstructs the 3D volume from projections.
 
     args:
-        projections: Projection images.
+        projections: (n_angles, N, M) Projection images.
         angles: Array of angles.
         center: Center positions. If None, the center will be automatically calculated.
         value_range: Range of values for normalization. If given, the reconstructed volume will be normalized to [0, 1].
@@ -387,16 +389,9 @@ def reconstruct(projections, angles, center=None, value_range=None):
         Reconstructed 3D volume.
     '''
 
-    pad_width = projections.shape[-1] // 4 + 1
-    if center is not None: center = center + pad_width
-    recon = tomopy.recon(np.pad(projections, ((0, 0), (0, 0), (pad_width, pad_width)), 'edge'),
-                            angles,
-                            center=center,
-                            algorithm=tomopy.astra,
-                            sinogram_order=False,
-                            options={'proj_type': 'cuda', 'method': 'FBP_CUDA', 'extra_options': {'FilterType': 'hamming'}},
-                            ncore=1)[:, pad_width:-pad_width, pad_width:-pad_width]
-    recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
+    sinogram = np.swapaxes(projections, 0, 1) # (N, n_angles, M)
+    recon = FBP(sinogram).run(angles, center) # (N, M, M)
+    recon = np.transpose(recon, (0, 2, 1)) # (M, N, M)
 
     if value_range is not None:
         vmin, vmax = value_range
@@ -441,6 +436,7 @@ def main():
     parser.add_argument('-r', dest='ring_removal', type=int, choices=[0, 1, 2], default=1, 
                         help='ring removal option: 0(no ring removal), 1(fast ring removal, default) or 2(Fourier-Wavelet based ring removal)')
     parser.add_argument('-a', dest='angle_shift', action='store_true', help='do angle shift correction')
+    parser.add_argument('-s', dest='sector', action='store_true', help='do angle shift in sectors')
     parser.add_argument('-c', dest='center_shift', action='store_true', help='do center shift correction')
     parser.add_argument('-b', dest='batch_size', type=int, help='batch size for reconstruction (default = 100)', default=100)
     parser.add_argument('-o', dest='output_dir', type=str, help='directory of output', default='./recons')
@@ -457,20 +453,23 @@ def main():
     df_projection, ff_projection = read_background(args.proj_dir)
 
     logger.info("Reading projections")
-    projections, angles = read_projections(proj_files, df_projection, ff_projection, align=not args.center_shift)
+    projections, angles = read_projections(proj_files, df_projection, ff_projection, align=True)
 
     centers = None
     if args.angle_shift and args.center_shift:
         for i in range(3):
-            logger.info("Angle and center shift correction iteration {}/3".format(i))
-            angles = find_correct_angles(projections, angles, centers, init_points=30, n_iter=150)
+            logger.info("Angle and center shift correction iteration {}/3".format(i+1))
+            angles = find_correct_angles(projections, angles, centers, n_keypoints=8, n_sectors=1, n_iter=200)
             centers = find_correct_centers(projections, angles, init_points=30, n_iter=100)
+        if args.sector:
+            logger.info("Angle shift correction with 6 sectors.")
+            angles = find_correct_angles(projections, angles, centers, n_keypoints=8, n_sectors=6, n_iter=60)
     elif args.center_shift:
         logger.info("Finding correct center")
         centers = find_correct_centers(projections, angles)
     elif args.angle_shift:
         logger.info("Finding correct angles")
-        angles = find_correct_angles(projections, angles)
+        angles = find_correct_angles(projections, angles, centers, n_keypoints=8, n_sectors=6, n_iter=100)
 
     if args.center_shift:
         logger.info("Aligning projections using found centers")

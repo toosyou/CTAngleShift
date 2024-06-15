@@ -6,6 +6,7 @@ import cupy as cp
 bp_kernel = cp.RawKernel(r'''
 extern "C" __global__
 void bp_kernel(const cudaTextureObject_t sinogram, 
+                const int n_sectors,
                 const float *theta_sin,
                 const float *theta_cos, 
                 const float center_offset, 
@@ -22,10 +23,15 @@ void bp_kernel(const cudaTextureObject_t sinogram,
     
     // crop to a circle
     if (x_centered * x_centered + y_centered * y_centered > r * r) return; 
-
+    int section = 0;
+    if(n_sectors > 1){
+        float theta = atan2(x_centered, y_centered);
+        section = floorf((theta + 3.1415926) / (2.0 * 3.1415926 / (float)(n_sectors)));
+    }
+                         
     float value = 0.;
     for (int i = 0; i < n_angles; i++){
-        const float sy = x_centered * theta_cos[i] - y_centered * theta_sin[i] + r + center_offset;
+        const float sy = x_centered * theta_cos[section * n_angles + i] - y_centered * theta_sin[section * n_angles + i] + r + center_offset;
         value += tex2D<float>(sinogram, sy + 0.5f, (float)i + 0.5f);
     }
     recon[x * M + y] = value / (2.0f * (float)n_angles);
@@ -102,15 +108,18 @@ class FBP:
         if center_offset is None: center_offset = [0.0] * self.N
         elif np.isscalar(center_offset): center_offset = [center_offset] * self.N
 
-        theta = cp.array(theta, dtype=cp.float32)
+        if theta.ndim == 1: theta = theta.reshape(1, -1)
+        theta, n_sectors = cp.array(theta - theta[:, 0:1], dtype=cp.float32), theta.shape[0]
+
         theta_sin, theta_cos = cp.sin(theta), cp.cos(theta)
 
         recons = list()
         for sinogram, offset in zip(self.sinograms, center_offset):
             recon = cp.zeros((self.M, self.M), dtype=cp.float32)
             grid_size = np.ceil(self.M / 32).astype(int)
+            
             bp_kernel((grid_size, grid_size), (32, 32), 
-                      (sinogram, theta_sin, theta_cos, 
+                      (sinogram, n_sectors, theta_sin, theta_cos, 
                        np.float32(offset), self.n_angles, self.M, recon))
             recons.append(recon)
 

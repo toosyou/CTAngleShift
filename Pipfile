@@ -11,10 +11,10 @@ loguru = "*"
 torch = "*"
 torchvision = "*"
 torchaudio = "*"
-radon-transformation = {editable = true, path = "./Radon-Transformation"}
-xitorch = "*"
 jupyter = "*"
 numba = "*"
+phantominator = "*"
+pandas = "*"
 
 [dev-packages]
 jupyterlab = "*"
