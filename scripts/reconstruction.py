@@ -103,85 +103,79 @@ def align_projection(projections, align_matrix=None, centers=None):
 
     return projections
 
-def find_align_matrix(projections, df_projection, ff_projection):
+def align_mp(args):
+    '''
+    Aligns two images using ECC algorithm.
+
+    args:
+        im1: (H, W) First input image.
+        im2: (H, W) Second input image.
+        motion_model: Motion model type. Default is cv2.MOTION_EUCLIDEAN.
+
+    returns:
+        warp_matrix: Transformation matrix.
+        im2_aligned: Aligned second image.
+    '''
+    im1, im2, hcut, wcut = args
+    im1, im2 = im1.astype('float32'), im2.astype('float32')
+    
+    # Find size of image1
+    sz = im1.shape
+
+    # Define the motion model
+    warp_mode = cv2.MOTION_EUCLIDEAN
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+
+    # Specify the number of iterations.
+    number_of_iterations = 5000
+
+    # Specify the threshold of the increment
+    termination_eps = 1e-8
+
+    # Define termination criteria
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
+
+    # Run the ECC algorithm. The results are stored in warp_matrix.
+    (cc, warp_matrix) = cv2.findTransformECC(im1, im2, warp_matrix, warp_mode, criteria, inputMask=None, gaussFiltSize=1)
+    im2_aligned = cv2.warpAffine(im2, warp_matrix, (sz[1],sz[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+
+    diff = np.abs(im1 - im2_aligned)[hcut: -hcut, wcut: -wcut].mean()
+
+    return warp_matrix, diff
+
+def find_align_matrix(projections):
     '''
     Finds the alignment matrix for projection images.
 
     args:
         proj_files: List of projection file paths.
-        df_projection: Dark field projection.
-        ff_projection: Flat field projection.
 
     returns:
         align_matrix: Alignment matrix.
         angles: Array of angles for alignment.
     '''
-    def align(im1, im2, motion_model=cv2.MOTION_EUCLIDEAN):
-        '''
-        Aligns two images using ECC algorithm.
-
-        args:
-            im1: (H, W) First input image.
-            im2: (H, W) Second input image.
-            motion_model: Motion model type. Default is cv2.MOTION_EUCLIDEAN.
-
-        returns:
-            warp_matrix: Transformation matrix.
-            im2_aligned: Aligned second image.
-        '''
-
-        im1, im2 = im1.astype('float32'), im2.astype('float32')
-        
-        # Find size of image1
-        sz = im1.shape
-
-        # Define the motion model
-        warp_mode = motion_model
-        
-        # Define 2x3 or 3x3 matrices and initialize the matrix to identity
-        if warp_mode == cv2.MOTION_HOMOGRAPHY :
-            warp_matrix = np.eye(3, 3, dtype=np.float32)
-        else :
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-
-        # Specify the number of iterations.
-        number_of_iterations = 5000
-
-        # Specify the threshold of the increment
-        
-        termination_eps = 1e-8
-
-        # Define termination criteria
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, number_of_iterations,  termination_eps)
-
-        # Run the ECC algorithm. The results are stored in warp_matrix.
-        (cc, warp_matrix) = cv2.findTransformECC(im1, im2, warp_matrix, warp_mode, criteria, inputMask=None, gaussFiltSize=1)
-        
-        if warp_mode == cv2.MOTION_HOMOGRAPHY :
-            # Use warpPerspective for Homography
-            im2_aligned = cv2.warpPerspective (im2, warp_matrix, (sz[1],sz[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
-        else :
-            # Use warpAffine for Translation, Euclidean and Affine
-            im2_aligned = cv2.warpAffine(im2, warp_matrix, (sz[1],sz[0]), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
-
-        return warp_matrix, im2_aligned
-
     n_angles, height, width = projections.shape
 
     # load the first and a few last projections
     hcut, wcut = height // 4, width // 4
 
     first = projections[0]
-    lasts = projections[-3:][::-1]
-    align_result = [align(first, np.flip(i_last, axis=-1)) for i_last in lasts] # [(warp_matrix, aligned_image), ...]
+    lasts = projections[-12:][::-1]
+    # align_result = [align(first, np.flip(i_last, axis=-1)) for i_last in lasts] # [(warp_matrix, aligned_image), ...]
+    with Pool() as pool:
+        results = pool.imap(align_mp, [(first, np.flip(i_last, axis=-1), hcut, wcut) for i_last in lasts])
 
-    diffs = [np.abs(first - aligned_image)[hcut: -hcut, wcut: -wcut].mean() for _, aligned_image in align_result]
+        # Using tqdm to wrap the results for progress tracking
+        align_result = list(tqdm(results, total=len(lasts), desc='Aligning projections'))
 
-    warp_matrix = align_result[np.argmin(diffs)][0]
+    # get the warp matrix of the alignment with the least diff
+    index_best = np.argmin([r[1] for r in align_result])
+    warp_matrix = align_result[index_best][0]
 
     angles = np.linspace(0, np.pi, n_angles)
-    angles *= np.pi / angles[-1-np.argmin(diffs)] # make sure the most aligned image is at 180 degree
+    angles *= np.pi / angles[-1-index_best] # make sure the most aligned image is at 180 degree
 
+    # calculate the align matrix
     theta = (np.arccos(warp_matrix[0, 0]) + np.arcsin(warp_matrix[0, 1])) / 2
     align_matrix = np.array([[np.cos(-theta), np.sin(-theta), -warp_matrix[0, 2] / 2], 
                                 [-np.sin(-theta), np.cos(-theta), warp_matrix[1, 2] / 2]])
@@ -216,7 +210,7 @@ def read_projections(proj_files, df_projection, ff_projection, align=False):
             projections[i] = p
 
     if align:
-        align_matrix, angles = find_align_matrix(projections, df_projection, ff_projection)
+        align_matrix, angles = find_align_matrix(projections)
         projections = align_projection(projections, align_matrix)
 
     return projections, angles
@@ -448,6 +442,8 @@ def main():
 
     logger.info("Finding projection filenames")
     proj_files = sorted(glob(args.proj_dir + '/tomo*.tif'))
+    if not len(proj_files):
+        proj_files = sorted(glob(args.proj_dir + '/TOMO*.tif'))
 
     logger.info("Reading background")
     df_projection, ff_projection = read_background(args.proj_dir)
