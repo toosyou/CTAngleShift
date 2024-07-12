@@ -15,6 +15,7 @@ jupyter = "*"
 numba = "*"
 phantominator = "*"
 pandas = "*"
+ipywidgets = "*"
 
 [dev-packages]
 jupyterlab = "*"

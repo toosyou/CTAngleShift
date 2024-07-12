@@ -104,7 +104,7 @@ def padded_recon(sinogram, theta, center, pad_width):
     recon = tomopy.circ_mask(recon, axis=0, ratio=1.0, val=0) # (N, M, M)
     return recon
 
-def center_correction(sinogram, z_indices, total_z, theta, center_range, init_points=50, n_iter=300):
+def center_correction(sinogram, z_indices, total_z, theta, center_range, zoom=None, init_points=50, n_iter=300):
     '''
     The function center_correction() uses Bayesian Optimization to correct shifts in the center of a given sinogram.
 
@@ -124,7 +124,7 @@ def center_correction(sinogram, z_indices, total_z, theta, center_range, init_po
         X = [z_indices[0], z_indices[-1]]
         y = [start_center, end_center]
         center_offset = interp1d(X, y, kind='linear')(z_indices)
-        return -acutance(fbp.run(theta, center_offset, to_host=False))
+        return -acutance(fbp.run(theta, center_offset, zoom, to_host=False))
         
     # make sure sinogram is 3D
     if sinogram.ndim == 2:
@@ -219,3 +219,78 @@ def theta_correction(sinogram, assumed_theta, center, n_keypoints, shift_range, 
         pbar.set_description(f'theta correction - loss: {losses.sum() / n_sectors:.6f}')
 
     return np.array([interp_theta(np.array(list(optimizer.max['params'].values()))) for optimizer in optimizers])
+
+
+def lens_correction(sinogram, theta, center, params_range, n_sectors=1, n_iter=50):
+    '''
+    TODO: fix desc 
+
+    Correct theta shift in sinogram.
+
+    args:
+        sinogram: (N, n_angles, M)
+        assumed_theta: (n_angles, ) array of the original theta in radians.
+        center: (N, ) giving the center of rotation, if None, it is automatically calculated.
+        n_keypoints: Integer value giving the number of keypoints.
+        shift_range: A tuple of (low, high) to indicate the range of shift in radians.
+        n_sectors: Integer value giving the number of sectors. Default value is set to 6.
+        n_iter: Optional, sets the number of iterations in Bayesian Optimization. Default value is set to 300.
+
+    return:
+        corrected_theta: (n_angles,) array of corrected theta
+    '''
+    def interp_zoom(k1, k2, k3):
+        '''
+        Interpolate keypoints to get theta.
+        '''
+        X = np.linspace(-1, 1, width, dtype=float)
+        y = 0
+        r_squared = X ** 2 + y ** 2
+        zoom = 1 + k1 * r_squared + k2 * r_squared ** 2 + k3 * r_squared ** 3
+        return zoom
+    
+    def calcualte_acutance(args):
+        '''
+        Calculate acutance of a given theta.
+        '''
+        k1, k2, k3 = args['k1'], args['k2'], args['k3']
+        zoom = interp_zoom(k1, k2, k3)
+        return circular_acutance(fbp.run(theta, center_offset, zoom, to_host=False)) * -1
+    
+    # make sure sinogram is 3D
+    if sinogram.ndim == 2:
+        sinogram = np.array(sinogram)[np.newaxis, ...]
+
+    N, n_angles, width = sinogram.shape
+    center_offset = 0 if center is None else center - width / 2
+
+    fbp, circular_acutance = FBP(sinogram), CircularAcutance(width, n_sectors=n_sectors)
+
+    # Bounded region of parameter space
+    pbounds = {
+        'k1': (0, 0),
+        'k2': (0, 0),
+        'k3': params_range
+    }
+
+    optimizers = [BayesianOptimization(f=None, pbounds=pbounds, verbose=1, allow_duplicate_points=True) for _ in range(n_sectors)]
+
+    # probe the assumed center and zoom
+    probe_params = {'k1': 0, 'k2': 0, 'k3': 0}
+    for optimizer, probe_loss in zip(optimizers, calcualte_acutance(probe_params)):
+        optimizer.register(params=probe_params, target=probe_loss)
+
+    utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
+
+    for _ in (pbar := tqdm(range(n_iter), desc='zoom correction - loss: -')):
+        suggestions = [optimizer.suggest(utility) for optimizer in optimizers]
+        losses = np.array([calcualte_acutance(suggestion) for suggestion in suggestions])
+
+        for i, optimizer in enumerate(optimizers):
+            for suggestion, loss in zip(suggestions, losses):
+                optimizer.register(params=suggestion, target=loss[i])
+        
+        pbar.set_description(f'zoom correction - loss: {losses.sum() / n_sectors:.6f}')
+    
+    print(optimizers[0].max['params'])
+    return np.array([interp_zoom(**optimizer.max['params']) for optimizer in optimizers])

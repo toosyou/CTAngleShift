@@ -9,6 +9,7 @@ void bp_kernel(const cudaTextureObject_t sinogram,
                 const int n_sectors,
                 const float *theta_sin,
                 const float *theta_cos, 
+                const float *zoom,
                 const float center_offset, 
                 const int n_angles, 
                 const int M, float *recon){
@@ -31,8 +32,15 @@ void bp_kernel(const cudaTextureObject_t sinogram,
                          
     float value = 0.;
     for (int i = 0; i < n_angles; i++){
-        const float sy = x_centered * theta_cos[section * n_angles + i] - y_centered * theta_sin[section * n_angles + i] + r + center_offset;
-        value += tex2D<float>(sinogram, sy + 0.5f, (float)i + 0.5f);
+        float sy = x_centered * theta_cos[section * n_angles + i] - y_centered * theta_sin[section * n_angles + i];
+        int sy_floor = floorf(sy); 
+        float floor_ratio = sy - sy_floor;
+        float ceil_ratio = 1.0f - floor_ratio;
+        sy = sy / (zoom[(int)(sy_floor + r)] * ceil_ratio + zoom[(int)(sy_floor + 1 + r)] * floor_ratio);
+        sy = sy + r + center_offset;
+                         
+        if (sy >= 0 && sy < M)
+            value += tex2D<float>(sinogram, sy + 0.5f, (float)i + 0.5f);
     }
     recon[x * M + y] = value / (2.0f * (float)n_angles);
 }        
@@ -104,7 +112,7 @@ class FBP:
         texture_readback((self.n_angles // 32, self.M // 32), (32, 32), (self.sinograms[0], self.n_angles, self.M, test_sinogram))
         return test_sinogram.get()
 
-    def run(self, theta, center_offset=None, to_host=True):
+    def run(self, theta, center_offset=None, zoom=None, to_host=True):
         if center_offset is None: center_offset = [0.0] * self.N
         elif np.isscalar(center_offset): center_offset = [center_offset] * self.N
 
@@ -113,13 +121,15 @@ class FBP:
 
         theta_sin, theta_cos = cp.sin(theta), cp.cos(theta)
 
+        zoom = cp.ones((self.M, ), dtype=cp.float32) if zoom is None else cp.array(zoom, dtype=cp.float32)
+        
         recons = list()
         for sinogram, offset in zip(self.sinograms, center_offset):
             recon = cp.zeros((self.M, self.M), dtype=cp.float32)
             grid_size = np.ceil(self.M / 32).astype(int)
             
             bp_kernel((grid_size, grid_size), (32, 32), 
-                      (sinogram, n_sectors, theta_sin, theta_cos, 
+                      (sinogram, n_sectors, theta_sin, theta_cos, zoom,
                        np.float32(offset), self.n_angles, self.M, recon))
             recons.append(recon)
 
